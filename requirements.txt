@@ -1,0 +1,8 @@
+flask
+flask-cors
+sqlalchemy
+python-dotenv
+psycopg2-binary
+PyJWT
+requests
+cloudinary
