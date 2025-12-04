@@ -159,7 +159,7 @@ def analyze_drawing():
         
         if not results or sum(cat.get('total_pieces', 0) for cat in results.values()) == 0:
              # Check if analysis failed completely
-             raise Exception("Analysis failed to produce any valid cutting list components.")
+             raise Exception("Unable to extract measurements from the drawing. Please ensure the image is clear, contains visible dimensions, and is a technical drawing of a kitchen cabinet.")
         
         # Generate DXF file
         dxf_content = analyzer.generate_dxf()
@@ -201,11 +201,25 @@ def analyze_drawing():
     except Exception as e:
         current_app.logger.error(f"Analysis failed for {getattr(file, 'filename', 'unknown file')}: {str(e)}", exc_info=True)
         
+        # Provide more helpful error messages based on the exception
+        error_message = str(e)
+        user_message = "Analysis failed. Please try again."
+        
+        # Check for specific error patterns
+        if 'timeout' in error_message.lower() or 'timed out' in error_message.lower():
+            user_message = "Analysis timed out. The AI service took too long to respond. Please try again with a clearer image or check your internet connection."
+        elif 'api key' in error_message.lower() or 'authentication' in error_message.lower():
+            user_message = "API keys are not configured properly. Please contact the administrator to set up Google Cloud Vision and OpenAI API keys."
+        elif 'unable to extract' in error_message.lower() or 'no valid cutting list' in error_message.lower():
+            user_message = error_message  # Use the detailed message we created
+        elif 'connection' in error_message.lower():
+            user_message = "Failed to connect to AI services. Please check your internet connection and try again."
+        
         return jsonify(
             {
                 "success": False,
-                "error": str(e),
-                "message": "Analysis failed. Please check the image and ensure API keys (Google/OpenAI) are configured correctly.",
+                "error": error_message,
+                "message": user_message,
                 "timestamp": datetime.now().isoformat()
             }
         ), 500
