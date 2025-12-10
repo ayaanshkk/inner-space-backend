@@ -1003,16 +1003,22 @@ class Assignment(Base):
     
     type = Column(ASSIGNMENT_TYPE_ENUM, nullable=False, default='job')
     title = Column(String(255), nullable=False)
-    date = Column(Date, nullable=False)
+    date = Column(Date, nullable=False)  # Keep for backward compatibility
+    
+    # ✅ NEW FIELDS: Add start_date and end_date for task date ranges
+    start_date = Column(Date, nullable=True)
+    end_date = Column(Date, nullable=True)
+    customer_name = Column(String(200), nullable=True)
     
     user_id = Column(Integer, ForeignKey('users.id'))
     team_member = Column(String(200))
     
     created_by = Column(Integer, ForeignKey('users.id'))
+    updated_by = Column(Integer, ForeignKey('users.id'))
     
     job_id = Column(String(36), ForeignKey('jobs.id'))
     customer_id = Column(String(36), ForeignKey('customers.id'))
-    job_type = Column(String(100))  # ✅ ADD THIS LINE
+    job_type = Column(String(100))
     
     start_time = Column(Time)
     end_time = Column(Time)
@@ -1023,56 +1029,103 @@ class Assignment(Base):
     status = Column(String(20), default='Scheduled')
     
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_by = Column(Integer)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
+    # ✅ RELATIONSHIPS (keep existing)
     job = relationship('Job', backref='assignments')
     customer = relationship('Customer', backref='assignments')
-    assigned_user = relationship('User', foreign_keys=[user_id], backref='assignments')
-    creator = relationship('User', foreign_keys=[created_by], backref='created_assignments')
+    
+    user = relationship(
+        'User', 
+        foreign_keys=[user_id], 
+        backref='assigned_assignments',
+        overlaps="created_by_user,updated_by_user"
+    )
+    
+    created_by_user = relationship(
+        'User', 
+        foreign_keys=[created_by], 
+        backref='created_assignments',
+        overlaps="user,updated_by_user"
+    )
+    
+    updated_by_user = relationship(
+        'User', 
+        foreign_keys=[updated_by], 
+        backref='updated_assignments',
+        overlaps="user,created_by_user"
+    )
     
     def to_dict(self):
-        # ✅ Get created_by and updated_by names
-        created_by_name = None
-        updated_by_name = None
-        
-        if self.creator:
-            created_by_name = self.creator.full_name
-        if self.updated_by:
-            from ..db import SessionLocal
-            session = SessionLocal()
+        """Convert assignment to dictionary with safe attribute access"""
+        try:
+            created_by_name = None
             try:
-                updated_user = session.get(User, self.updated_by)
-                if updated_user:
-                    updated_by_name = updated_user.full_name
-            finally:
-                session.close()
-        
-        return {
-            'id': self.id,
-            'type': self.type,
-            'title': self.title,
-            'date': self.date.isoformat() if self.date else None,
-            'user_id': self.user_id,
-            'team_member': self.team_member,
-            'job_id': self.job_id,
-            'customer_id': self.customer_id,
-            'job_type': self.job_type,  # ✅ ADD THIS
-            'start_time': self.start_time.strftime('%H:%M') if self.start_time else None,
-            'end_time': self.end_time.strftime('%H:%M') if self.end_time else None,
-            'estimated_hours': self.estimated_hours,
-            'notes': self.notes,
-            'priority': self.priority,
-            'status': self.status,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
-            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
-            'created_by': self.created_by,
-            'created_by_name': created_by_name,  # ✅ ADD THIS
-            'updated_by': self.updated_by,
-            'updated_by_name': updated_by_name,  # ✅ ADD THIS
-            'job_reference': self.job.job_reference if self.job else None,
-            'customer_name': self.customer.name if self.customer else None,
-        }
+                if self.created_by_user:
+                    created_by_name = self.created_by_user.full_name
+            except Exception as e:
+                print(f"Error getting created_by_user: {e}")
+            
+            updated_by_name = None
+            try:
+                if self.updated_by_user:
+                    updated_by_name = self.updated_by_user.full_name
+            except Exception as e:
+                print(f"Error getting updated_by_user: {e}")
+            
+            job_reference = None
+            try:
+                if self.job:
+                    job_reference = self.job.job_reference
+            except Exception as e:
+                print(f"Error getting job reference: {e}")
+            
+            customer_name = None
+            try:
+                if self.customer:
+                    customer_name = self.customer.name
+            except Exception as e:
+                print(f"Error getting customer name: {e}")
+            
+            return {
+                'id': self.id,
+                'type': self.type,
+                'title': self.title,
+                'date': self.date.isoformat() if self.date else None,
+                # ✅ NEW FIELDS IN RESPONSE
+                'start_date': self.start_date.isoformat() if self.start_date else None,
+                'end_date': self.end_date.isoformat() if self.end_date else None,
+                'customer_name': self.customer_name or customer_name,
+                'user_id': self.user_id,
+                'team_member': self.team_member,
+                'job_id': self.job_id,
+                'customer_id': self.customer_id,
+                'job_type': self.job_type,
+                'start_time': self.start_time.strftime('%H:%M') if self.start_time else None,
+                'end_time': self.end_time.strftime('%H:%M') if self.end_time else None,
+                'estimated_hours': self.estimated_hours,
+                'notes': self.notes,
+                'priority': self.priority,
+                'status': self.status,
+                'created_at': self.created_at.isoformat() if self.created_at else None,
+                'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+                'created_by': self.created_by,
+                'created_by_name': created_by_name,
+                'updated_by': self.updated_by,
+                'updated_by_name': updated_by_name,
+                'job_reference': job_reference,
+            }
+        except Exception as e:
+            print(f"Error in Assignment.to_dict(): {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'id': self.id,
+                'type': self.type,
+                'title': self.title,
+                'date': self.date.isoformat() if self.date else None,
+                'error': 'Error loading full assignment data'
+            }
 
 class FormDocument(Base):
     __tablename__ = 'form_documents'

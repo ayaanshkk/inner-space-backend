@@ -126,8 +126,7 @@ def create_app():
     from backend.routes import (
         auth_routes, db_routes,
         notification_routes, assignment_routes,
-        customer_routes, file_routes, materials_routes, job_routes, action_items_routes, analysis_routes,
-    )
+        customer_routes, file_routes, materials_routes, job_routes, action_items_routes, manual_entry_routes, analysis_routes)
 
     app.register_blueprint(auth_routes.auth_bp)
     # app.register_blueprint(approvals_routes.approvals_bp)
@@ -141,6 +140,7 @@ def create_app():
     app.register_blueprint(materials_routes.materials_bp)
     app.register_blueprint(job_routes.job_bp)
     app.register_blueprint(action_items_routes.action_items_bp)  # ✅ FIXED
+    app.register_blueprint(manual_entry_routes.manual_entry_bp)
     app.register_blueprint(analysis_routes.analysis_bp)
 
     # ============================================
