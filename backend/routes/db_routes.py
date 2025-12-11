@@ -609,7 +609,9 @@ def get_pipeline_data():
                         'id': project.id,
                         'customer_id': customer.id,
                         'project_name': project.project_name or 'Unnamed Project',
-                        'project_type': project.project_type or 'Unknown', 
+                        'project_type': project.project_type or 'Unknown',
+                        # 'job_name': project.project_name or 'Unnamed Project',
+                        # 'job_type': project.project_type or 'Unknown', 
                         'stage': project_stage,  # ✅ Use stored value
                         'date_of_measure': project.date_of_measure.isoformat() if project.date_of_measure else None,
                         'notes': project.notes,
