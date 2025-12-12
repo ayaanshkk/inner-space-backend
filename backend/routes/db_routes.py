@@ -863,41 +863,76 @@ def handle_assignments():
     try:
         if request.method == 'POST':
             data = request.json
+            
+            # ✅ Create assignment with proper fields
             assignment = Assignment(
+                id=data.get('id') or str(uuid.uuid4()),
+                type=data.get('type', 'job'),
                 title=data.get('title', ''),
-                description=data.get('description', ''),
-                assigned_to=data.get('assigned_to'),
-                due_date=datetime.strptime(data['due_date'], '%Y-%m-%d').date() if data.get('due_date') else None,
-                created_by=get_current_user_email(data)
+                date=datetime.strptime(data['date'], '%Y-%m-%d').date() if data.get('date') else None,
+                start_date=data.get('start_date'),
+                end_date=data.get('end_date'),
+                start_time=data.get('start_time'),
+                end_time=data.get('end_time'),
+                estimated_hours=data.get('estimated_hours'),
+                notes=data.get('notes'),
+                priority=data.get('priority', 'Medium'),
+                status=data.get('status', 'Scheduled'),
+                user_id=data.get('user_id'),
+                team_member=data.get('team_member'),
+                job_id=data.get('job_id'),
+                customer_id=data.get('customer_id'),
+                customer_name=data.get('customer_name'),
+                job_type=data.get('job_type'),
+                created_by=data.get('created_by'),
+                created_at=datetime.utcnow()
             )
             session.add(assignment)
             session.commit()
-            return jsonify({'id': assignment.id, 'message': 'Assignment created successfully'}), 201
+            session.refresh(assignment)
+            
+            return jsonify(assignment.to_dict()), 201
 
         # GET - Filter by user role
-        current_user_role = request.current_user.role if hasattr(request, 'current_user') else None
-        
-        # ✅ FILTER ASSIGNMENTS BY ROLE
-        if current_user_role == 'Production':
-            # Production users only see assignments for "Production Team"
-            assignments = session.query(Assignment).filter(
-                Assignment.team_member == 'Production Team'
-            ).order_by(Assignment.date.asc()).all()
-        elif current_user_role == 'Manager':
-            # Managers see all assignments
-            assignments = session.query(Assignment).order_by(Assignment.date.asc()).all()
-        else:
-            # Other roles see assignments assigned to them
-            user_id = request.current_user.id if hasattr(request, 'current_user') else None
-            assignments = session.query(Assignment).filter(
-                Assignment.user_id == user_id
-            ).order_by(Assignment.date.asc()).all()
-        
-        return jsonify([a.to_dict() for a in assignments])
+        try:
+            current_user_role = request.current_user.role if hasattr(request, 'current_user') else None
+            current_user_id = request.current_user.id if hasattr(request, 'current_user') else None
+            current_user_name = request.current_user.full_name if hasattr(request, 'current_user') else None
+            
+            # ✅ Get all assignments first
+            all_assignments = session.query(Assignment).order_by(Assignment.date.asc()).all()
+            
+            # ✅ Filter based on role
+            if current_user_role == 'Production':
+                # Production users see assignments for "Production Team"
+                assignments = [a for a in all_assignments if a.team_member == 'Production Team']
+            elif current_user_role == 'Manager' or current_user_role == 'Sales':
+                # Managers and Sales see all assignments
+                assignments = all_assignments
+            else:
+                # Other roles see assignments assigned to them (by user_id OR team_member matching their name)
+                assignments = [
+                    a for a in all_assignments 
+                    if (hasattr(a, 'user_id') and a.user_id == current_user_id) or 
+                       (a.team_member and current_user_name and a.team_member.lower() == current_user_name.lower())
+                ]
+            
+            return jsonify([a.to_dict() for a in assignments])
+            
+        except Exception as filter_error:
+            # If filtering fails, return all assignments for managers, empty for others
+            current_app.logger.warning(f"Assignment filtering failed: {filter_error}")
+            if current_user_role in ['Manager', 'Sales']:
+                assignments = session.query(Assignment).order_by(Assignment.date.asc()).all()
+                return jsonify([a.to_dict() for a in assignments])
+            else:
+                return jsonify([])
         
     except Exception as e:
         session.rollback()
         current_app.logger.error(f"Error in /assignments: {e}")
+        import traceback
+        current_app.logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
