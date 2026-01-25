@@ -1290,3 +1290,124 @@ class ActionItem(Base):
     
     # Relationships
     customer = relationship("Customer", backref="action_items")
+
+# ----------------------------------
+# Drawing Analyser / Cutting Lists
+# ----------------------------------
+
+class Drawing(Base):
+    __tablename__ = 'drawings'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Links (optional)
+    customer_id = Column(String(36), ForeignKey('customers.id'), nullable=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=True)
+    project_id = Column(String(36), ForeignKey('projects.id'), nullable=True)
+    
+    # Project details
+    project_name = Column(String(200), nullable=False)
+    original_filename = Column(String(255), nullable=False)
+    file_path = Column(String(500), nullable=False)
+    
+    # OCR processing
+    status = Column(String(50), default='pending')
+    ocr_method = Column(String(50))
+    confidence = Column(Numeric(5, 4))
+    raw_ocr_output = Column(Text)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # User who uploaded
+    uploaded_by = Column(Integer, ForeignKey('users.id'), nullable=True)
+    
+    # Relationships
+    cutting_list = relationship('CuttingListItem', back_populates='drawing', lazy=True, cascade='all, delete-orphan')
+    uploader = relationship('User', backref='uploaded_drawings')
+    
+    def _calculate_total_area(self):
+        """Calculate total area from cutting list items"""
+        total = 0.0  # ✅ Use float
+        for item in self.cutting_list:
+            if item.area_m2 is not None:
+                total += float(item.area_m2)  # ✅ Convert Decimal to float
+        return round(total, 4)  # Round to 4 decimal places
+    
+    def _calculate_total_pieces(self):
+        """Calculate total pieces from cutting list"""
+        return sum(item.quantity for item in self.cutting_list)
+    
+    def to_dict(self, include_cutting_list=False):
+        data = {
+            'id': self.id,
+            'customer_id': self.customer_id,
+            'job_id': self.job_id,
+            'project_id': self.project_id,
+            'project_name': self.project_name,
+            'original_filename': self.original_filename,
+            'file_path': self.file_path,
+            'status': self.status,
+            'ocr_method': self.ocr_method,
+            'confidence': float(self.confidence) if self.confidence is not None else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'uploaded_by': self.uploaded_by,
+            'total_pieces': self._calculate_total_pieces(),
+            'total_area_m2': self._calculate_total_area(),
+            'preview_url': f'/api/drawing-analyser/{self.id}/preview'
+        }
+        
+        if include_cutting_list:
+            data['cutting_list'] = [item.to_dict() for item in self.cutting_list]
+        
+        return data
+
+
+class CuttingListItem(Base):
+    __tablename__ = 'cutting_list_items'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    drawing_id = Column(String(36), ForeignKey('drawings.id', ondelete='CASCADE'), nullable=False)
+    
+    # Component details
+    component_type = Column(String(100), nullable=False)
+    part_name = Column(String(200), nullable=False)
+    
+    # Dimensions (in mm)
+    overall_unit_width = Column(Integer)
+    component_width = Column(Integer)
+    height = Column(Integer)
+    depth = Column(Integer)
+    quantity = Column(Integer, default=1)
+    material_thickness = Column(Integer, default=18)
+    
+    # Additional info
+    edge_banding_notes = Column(String(255))
+    area_m2 = Column(Numeric(10, 4))
+    section_index = Column(Integer)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    drawing = relationship('Drawing', back_populates='cutting_list')
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'drawing_id': self.drawing_id,
+            'component_type': self.component_type,
+            'part_name': self.part_name,
+            'overall_unit_width': self.overall_unit_width,
+            'component_width': self.component_width,
+            'height': self.height,
+            'depth': self.depth,
+            'quantity': self.quantity,
+            'material_thickness': self.material_thickness,
+            'edge_banding_notes': self.edge_banding_notes,
+            'area_m2': float(self.area_m2) if self.area_m2 is not None else 0.0,  # ✅ Always float
+            'section_index': self.section_index,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }

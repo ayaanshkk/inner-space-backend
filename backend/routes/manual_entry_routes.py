@@ -1,16 +1,5 @@
-"""
-Flask Routes for AI-Assisted Manual Cabinet Entry
-Two-phase approach:
-1. Extract dimensions → User confirms
-2. Calculate components → Generate cutting list
-"""
-
 from flask import Blueprint, request, jsonify
 import logging
-
-# These will be imported from your modules
-# from dimension_extractor import DimensionExtractor
-# from cabinet_calculator import CabinetCalculator
 
 logger = logging.getLogger('ManualEntryRoutes')
 
@@ -21,21 +10,21 @@ dimension_extractor = None
 cabinet_calculator = None
 
 try:
-    from ..dimension_extractor import DimensionExtractor
+    from backend.dimension_extractor import DimensionExtractor
     dimension_extractor = DimensionExtractor()
     logger.info("✅ DimensionExtractor initialized")
 except Exception as e:
     logger.error(f"Failed to initialize DimensionExtractor: {e}")
 
 try:
-    from ..cabinet_calculator import CabinetCalculator
+    from backend.cabinet_calculator import CabinetCalculator
     cabinet_calculator = CabinetCalculator()
     logger.info("✅ CabinetCalculator initialized")
 except Exception as e:
     logger.error(f"Failed to initialize CabinetCalculator: {e}")
 
 
-@manual_entry_bp.route('/analysis/extract-dimensions', methods=['POST'])
+@manual_entry_bp.route('/api/manual-entry/extract-dimensions', methods=['POST'])
 def extract_dimensions():
     """
     PHASE 1: Extract cabinet dimensions from drawing
@@ -89,7 +78,7 @@ def extract_dimensions():
         }), 500
 
 
-@manual_entry_bp.route('/analysis/calculate-cabinets', methods=['POST'])
+@manual_entry_bp.route('/api/manual-entry/calculate-cabinets', methods=['POST'])
 def calculate_cabinets():
     """
     PHASE 2: Calculate all components from confirmed cabinet list
@@ -154,11 +143,9 @@ def calculate_cabinets():
         }), 500
 
 
-@manual_entry_bp.route('/analysis/cabinet-types', methods=['GET'])
+@manual_entry_bp.route('/api/manual-entry/cabinet-types', methods=['GET'])
 def get_cabinet_types():
-    """
-    Get available cabinet types and their descriptions
-    """
+    """Get available cabinet types and their descriptions"""
     cabinet_types = {
         'standard_base': {
             'name': 'Standard Base',
