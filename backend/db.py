@@ -24,6 +24,11 @@ if not DATABASE_URL:
 else:
     print("✅ Using hosted PostgreSQL database.")
     
+    # ✅ CRITICAL FIX: SQLAlchemy 2.x requires 'postgresql://' instead of 'postgres://'
+    if DATABASE_URL.startswith('postgres://'):
+        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+        print("✅ Fixed database URL dialect for SQLAlchemy 2.x (postgres -> postgresql)")
+    
     # ✅ CRITICAL FIX: Remove the ?pgbouncer=true parameter
     # It's just a reminder for us - PostgreSQL doesn't understand it!
     if '?pgbouncer=true' in DATABASE_URL:
