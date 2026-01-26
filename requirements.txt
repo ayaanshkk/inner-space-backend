@@ -4,23 +4,21 @@ Flask-CORS==4.0.0
 Flask-Migrate==4.0.5
 SQLAlchemy==2.0.23
 psycopg2-binary==2.9.9
-python-dotenv
-openai
-pytesseract
-Pillow
-reportlab
-pandas
-openpyxl
-PyJWT
+python-dotenv==1.0.0
+openai>=1.12.0
+pytesseract==0.3.10
+Pillow==10.2.0
+reportlab==4.0.7
+pandas==2.1.3
+openpyxl==3.1.2
+PyJWT==2.8.0
 gunicorn==21.2.0
 Werkzeug>=3.0.0
-surya-ocr>=0.4.0
-cadquery>=2.4.0
 ezdxf==1.1.0
-Pillow==10.2.0
 pdf2image==1.17.0
 shapely>=2.0.0
 google-cloud-vision==3.5.0
-openai>=1.12.0
 opencv-python==4.8.1.78
 numpy==1.24.3
+# surya-ocr>=0.4.0  # Commented out - has build issues
+cadquery>=2.4.0  # This may also fail - see note below
