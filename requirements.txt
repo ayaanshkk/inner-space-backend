@@ -24,3 +24,4 @@ scipy==1.17.0
 # surya-ocr>=0.4.0  # Commented out - has build issues
 cadquery>=2.4.0  # This may also fail - see note below
 cloudinary==1.41.0
+anthropic==0.3.0
