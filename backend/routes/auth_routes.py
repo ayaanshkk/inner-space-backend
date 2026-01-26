@@ -9,6 +9,8 @@ import os
 
 from ..db import SessionLocal # 👈 SessionLocal is required for all native queries
 
+DEV_MODE = os.getenv('DEV_MODE', 'false').lower() == 'true'
+
 auth_bp = Blueprint('auth', __name__)
 
 # --- Configuration and Helpers ---
