@@ -505,6 +505,40 @@ def update_customer_stage_direct(customer_id):
     finally:
         session.close()
 
+@customer_bp.route('/forms/<string:form_id>', methods=['DELETE', 'OPTIONS'])
+@token_required
+def delete_form_submission(form_id):
+    """Delete a form submission (Manager/HR only)"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    session = SessionLocal()
+    try:
+        # Only Manager and HR can delete
+        if request.current_user.role not in ['Manager', 'HR']:
+            return jsonify({'error': 'You do not have permission to delete form submissions'}), 403
+        
+        form = session.get(CustomerFormData, form_id)
+        if not form:
+            return jsonify({'error': 'Form submission not found'}), 404
+        
+        session.delete(form)
+        session.commit()
+        
+        current_app.logger.info(f"Form submission {form_id} deleted by user {request.current_user.id}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Form submission deleted successfully'
+        }), 200
+        
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"Error deleting form submission {form_id}: {e}")
+        return jsonify({'error': 'Failed to delete form submission'}), 500
+    finally:
+        session.close()
+
 @customer_bp.route('/customers/<string:customer_id>', methods=['DELETE', 'OPTIONS'])
 @token_required
 def delete_customer(customer_id):

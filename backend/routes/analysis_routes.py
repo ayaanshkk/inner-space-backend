@@ -329,14 +329,22 @@ def list_drawings():
 
 @analysis_bp.route('/api/drawing-analyser/<drawing_id>/preview', methods=['GET'])
 def preview_drawing(drawing_id: str):
-    """Get drawing image file"""
+    """Get drawing image file - FIXED VERSION"""
     
     if not HAS_DATABASE:
         # Try to find file directly
         for ext in ALLOWED_EXTENSIONS:
             filepath = os.path.join(UPLOAD_FOLDER, f"{drawing_id}.{ext}")
             if os.path.exists(filepath):
-                return send_file(filepath, mimetype=f'image/{ext}')
+                # Determine mimetype
+                mimetype_map = {
+                    'png': 'image/png',
+                    'jpg': 'image/jpeg',
+                    'jpeg': 'image/jpeg',
+                    'pdf': 'application/pdf',
+                    'webp': 'image/webp'
+                }
+                return send_file(filepath, mimetype=mimetype_map.get(ext, 'image/jpeg'))
         return jsonify({'error': 'Drawing not found'}), 404
     
     session = SessionLocal()
@@ -350,7 +358,24 @@ def preview_drawing(drawing_id: str):
         if not os.path.exists(drawing.file_path):
             return jsonify({'error': 'File not found on disk'}), 404
         
-        return send_file(drawing.file_path, mimetype='image/jpeg')
+        # ✅ FIX: Determine correct mimetype from file extension
+        file_ext = os.path.splitext(drawing.file_path)[1].lower()
+        mimetype_map = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.pdf': 'application/pdf',
+            '.webp': 'image/webp'
+        }
+        
+        mimetype = mimetype_map.get(file_ext, 'image/jpeg')
+        
+        return send_file(
+            drawing.file_path, 
+            mimetype=mimetype,
+            as_attachment=False,
+            download_name=drawing.original_filename
+        )
         
     finally:
         session.close()
