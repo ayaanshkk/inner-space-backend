@@ -1,59 +1,22 @@
+"""
+Database Routes - Adapted for StreemLyne_MT schema
+Handles pipeline management, stage updates, and related operations
+"""
 import os
 import uuid
 from typing import Optional
 from flask import Blueprint, request, jsonify, current_app
 import json
-from datetime import datetime, date # Import date separately for explicit use
-from ..db import SessionLocal, Base, engine
-from ..models import (
-    User, Assignment, Customer, CustomerFormData, Fitter, Job,
-    ProductionNotification, Project
-)
-from .auth_helpers import token_required
+from datetime import datetime, date, timedelta
+from sqlalchemy import text, func
 from sqlalchemy.exc import OperationalError
-from sqlalchemy import func
-from sqlalchemy.orm import selectinload
-from .notification_routes import create_activity_notification
+
+from ..db import SessionLocal
+from .auth_helpers import token_required, get_current_tenant_id, get_current_employee_id
 
 db_bp = Blueprint('database', __name__)
 
-# Helper function to get current user's email safely
-def get_current_user_email(data=None):
-    if hasattr(request, 'current_user') and hasattr(request.current_user, 'email'):
-        return request.current_user.email
-    # Fallback to 'System' or data.get('created_by') from post body if needed
-    return data.get('created_by', 'System') if isinstance(data, dict) else 'System'
-
-
-@db_bp.route('/users', methods=['GET', 'POST'])
-@token_required
-def handle_users():
-    session = SessionLocal()
-    try:
-        if request.method == 'POST':
-            data = request.json
-            user = User(
-                email=data['email'],
-                name=data.get('name', ''),
-                role=data.get('role', 'user'),
-                created_by=get_current_user_email(data)
-            )
-            session.add(user)
-            session.commit()
-            return jsonify({'id': user.id, 'message': 'User created successfully'}), 201
-        
-        # FIXED: Uses session.query
-        users = session.query(User).all()
-        return jsonify([u.to_dict() for u in users])
-    except Exception as e:
-        session.rollback()
-        current_app.logger.error(f"Error handling users: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
-
-# ------------------ CUSTOMER STAGE ------------------
-
+# Define stage hierarchy
 PIPELINE_STAGE_ORDER = [
     "Lead", "Survey", "Design", "Quote",
     "Accepted", "Rejected", "Ordered",
@@ -63,590 +26,453 @@ PIPELINE_STAGE_ORDER = [
 
 
 def _extract_stage_from_payload(data: dict) -> Optional[str]:
-    """Extract stage from payload - SIMPLIFIED VERSION
-    
-    The frontend sends a simple payload like:
-    {
-        "stage": "Accepted",
-        "reason": "Moved via Kanban board",
-        "updated_by": "user@example.com"
-    }
-    
-    So we should just extract the 'stage' field directly.
-    """
+    """Extract stage from payload"""
     
     if not isinstance(data, dict):
         return None
 
-    # ✅ PRIMARY: Check for direct 'stage' field (most common case)
+    # Check for direct 'stage' field
     stage = data.get('stage')
     if stage and isinstance(stage, str):
         stage = stage.strip()
         if stage in PIPELINE_STAGE_ORDER:
             return stage
     
-    # ✅ FALLBACK: Check for object format (like {label: "Accepted", value: "Accepted"})
+    # Check for object format
     if isinstance(stage, dict):
         for key in ('value', 'label', 'stage'):
             inner = stage.get(key)
             if isinstance(inner, str) and inner.strip() in PIPELINE_STAGE_ORDER:
                 return inner.strip()
     
-    # ✅ FALLBACK: Check alternative field names
-    for field in ('target_stage', 'targetStage', 'new_stage', 'newStage'):
+    # Check alternative field names
+    for field in ('target_stage', 'targetStage', 'new_stage', 'newStage', 'process_stage'):
         alt_stage = data.get(field)
         if alt_stage and isinstance(alt_stage, str):
             alt_stage = alt_stage.strip()
             if alt_stage in PIPELINE_STAGE_ORDER:
                 return alt_stage
     
-    # If nothing found, return None
     return None
 
-@db_bp.route('/customers/<string:customer_id>/stage', methods=['PATCH', 'OPTIONS'])
+
+# ==========================================
+# CLIENT/CUSTOMER STAGE UPDATES
+# ==========================================
+
+@db_bp.route('/customers/<int:customer_id>/stage', methods=['PATCH', 'OPTIONS'])
 @token_required
 def update_customer_stage(customer_id):
-    """Update customer stage - ENHANCED VERSION
-    
-    ✅ NOTE: Customer stages are synced with their PROJECT stages.
-    When a customer has no projects, they stay in Lead.
-    When they have projects, their stage reflects the most advanced project stage.
-    """
+    """Update customer/client stage"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        # Get the customer
-        customer = session.query(Customer).filter_by(id=customer_id).first()
-        if not customer:
-            current_app.logger.error(f"❌ Customer {customer_id} not found")
+        tenant_id = get_current_tenant_id()
+        employee_id = get_current_employee_id()
+        
+        # Get current stage
+        get_stage_query = text("""
+            SELECT stage, client_company_name, client_contact_name
+            FROM "StreemLyne_MT"."Client_Master"
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """)
+        
+        result = session.execute(get_stage_query, {
+            'client_id': customer_id,
+            'tenant_id': tenant_id
+        })
+        client = result.fetchone()
+        
+        if not client:
             return jsonify({'error': 'Customer not found'}), 404
 
-        # Extract data
         data = request.json
-        updated_by_user = get_current_user_email(data)
         new_stage = _extract_stage_from_payload(data)
-        reason = data.get('reason', 'Stage updated via drag and drop')
         
-        current_app.logger.info(f"🔄 Stage update request for customer {customer_id}: {customer.stage} → {new_stage}")
+        current_app.logger.info(f"🔄 Stage update request for customer {customer_id}: {client.stage} → {new_stage}")
         
-        # Validate stage
         if not new_stage:
             return jsonify({'error': 'Stage is required'}), 400
 
         if new_stage not in PIPELINE_STAGE_ORDER:
             return jsonify({'error': f'Invalid stage: {new_stage}'}), 400
 
-        old_stage = customer.stage
+        old_stage = client.stage
         
-        # If stage hasn't changed, return early
         if old_stage == new_stage:
-            current_app.logger.info(f"ℹ️ Customer {customer_id} already in stage {new_stage}")
             return jsonify({
-                'message': 'Stage not changed', 
+                'message': 'Stage not changed',
                 'stage_updated': False,
-                'customer_id': customer.id,
+                'customer_id': customer_id,
                 'new_stage': new_stage,
                 'old_stage': old_stage
             }), 200
 
-        # Update customer stage
-        customer.stage = new_stage
-        customer.updated_by = updated_by_user
-        customer.updated_at = datetime.utcnow()
+        # Update client stage
+        update_query = text("""
+            UPDATE "StreemLyne_MT"."Client_Master"
+            SET stage = :stage
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """)
         
-        # Add audit note
-        note_entry = f"\n[{datetime.utcnow().isoformat()}] Stage changed from {old_stage} to {new_stage}. Reason: {reason}"
-        customer.notes = (customer.notes or '') + note_entry
+        session.execute(update_query, {
+            'stage': new_stage,
+            'client_id': customer_id,
+            'tenant_id': tenant_id
+        })
         
-        # ✅ FIXED: Create notifications for important stages
+        # Create notification for important stages
         notification_created = False
-        assignment_created = False
-        
-        try:
-            current_app.logger.info(f"🔍 Checking if {new_stage} requires notification...")
-            
-            # Import here to avoid circular import
-            from backend.routes.notification_routes import create_activity_notification
-            from datetime import timedelta
-            
-            # Define stage-specific notification messages
-            stage_notifications = {
-                'Accepted': {
-                    'emoji': '✅',
-                    'message': f"✅ Customer '{customer.name}' accepted the quote and moved to Accepted stage",
-                    'create': True
-                },
-                'Production': {
-                    'emoji': '🏭',
-                    'message': f"🏭 Customer '{customer.name}' is now in Production - Manufacturing started",
-                    'create': True
-                },
-                'Delivery': {
-                    'emoji': '🚚',
-                    'message': f"🚚 Customer '{customer.name}' is ready for delivery! Project completed and awaiting delivery",
-                    'create': True
-                },
-                'Installation': {
-                    'emoji': '🔧',
-                    'message': f"🔧 Installation scheduled for customer '{customer.name}'",
-                    'create': True
-                },
-                'Complete': {
-                    'emoji': '🎉',
-                    'message': f"🎉 Project COMPLETED for customer '{customer.name}'! Job finished successfully",
-                    'create': True
+        if new_stage in ['Accepted', 'Production', 'Delivery', 'Installation', 'Complete']:
+            try:
+                stage_emoji = {
+                    'Accepted': '✅',
+                    'Production': '🏭',
+                    'Delivery': '🚚',
+                    'Installation': '🔧',
+                    'Complete': '🎉'
                 }
-            }
-            
-            # Create notification if it's an important stage
-            if new_stage in stage_notifications:
-                current_app.logger.info(f"📢 Stage '{new_stage}' requires notification - creating now...")
-                stage_config = stage_notifications[new_stage]
                 
-                current_app.logger.info(f"📝 Notification message: {stage_config['message']}")
-                current_app.logger.info(f"👤 Moved by: {updated_by_user}")
-                current_app.logger.info(f"🆔 Customer ID: {customer.id}")
+                client_name = client.client_company_name or client.client_contact_name
+                emoji = stage_emoji.get(new_stage, '🔄')
+                message = f"{emoji} Customer '{client_name}' moved to {new_stage} stage"
                 
-                # ✅ CRITICAL FIX: Use create_activity_notification helper
-                create_activity_notification(
-                    session=session,
-                    message=stage_config['message'],
-                    job_id=None,
-                    customer_id=customer.id,
-                    moved_by=updated_by_user
-                )
+                notify_query = text("""
+                    INSERT INTO "StreemLyne_MT"."Notification_Master" (
+                        tenant_id,
+                        employee_id,
+                        client_id,
+                        notification_type,
+                        priority,
+                        message,
+                        read,
+                        dismissed
+                    ) VALUES (
+                        :tenant_id,
+                        :employee_id,
+                        :client_id,
+                        :notification_type,
+                        :priority,
+                        :message,
+                        false,
+                        false
+                    )
+                """)
+                
+                session.execute(notify_query, {
+                    'tenant_id': tenant_id,
+                    'employee_id': employee_id,
+                    'client_id': customer_id,
+                    'notification_type': 'stage_change',
+                    'priority': 'high' if new_stage == 'Accepted' else 'medium',
+                    'message': message
+                })
+                
                 notification_created = True
-                current_app.logger.info(f"✅ Successfully created {new_stage} notification for customer {customer_id}")
-            else:
-                current_app.logger.info(f"ℹ️ Stage '{new_stage}' does not require notification (not in: {list(stage_notifications.keys())})")
-            
-            # ✅ AUTO-CREATE ASSIGNMENT FOR PRODUCTION TEAM WHEN MOVED TO ACCEPTED
-            if new_stage == 'Accepted':
-                current_app.logger.info(f"📋 Creating assignment for customer {customer_id}...")
+                current_app.logger.info(f"✅ Created {new_stage} notification")
                 
-                assignment = Assignment(
-                    id=str(uuid.uuid4()),
-                    type='job',
-                    title=f"Order materials for {customer.name}",
-                    date=(datetime.utcnow() + timedelta(days=1)).date(),
-                    team_member='Production Team',
-                    customer_id=customer.id,
-                    notes=f"Order all necessary materials for {customer.name}'s project",
-                    priority='High',
-                    status='Scheduled',
-                    created_by=None,
-                    created_at=datetime.utcnow()
-                )
-                session.add(assignment)
-                assignment_created = True
-                current_app.logger.info(f"✅ Successfully created material order assignment for customer {customer_id}")
-                
-        except ImportError as import_error:
-            current_app.logger.error(f"❌ Failed to import notification function: {import_error}")
-            import traceback
-            current_app.logger.error(f"Import traceback: {traceback.format_exc()}")
-        except Exception as notif_error:
-            current_app.logger.error(f"❌ Failed to create notification or assignment: {notif_error}")
-            import traceback
-            current_app.logger.error(f"Notification error traceback: {traceback.format_exc()}")
+            except Exception as notif_error:
+                current_app.logger.error(f"⚠️ Failed to create notification: {notif_error}")
         
-        # Commit the transaction
         session.commit()
         
-        current_app.logger.info(f"✅ Customer {customer.id} stage updated from {old_stage} to {new_stage}")
-        current_app.logger.info(f"📊 Final status - Notification created: {notification_created}, Assignment created: {assignment_created}")
+        current_app.logger.info(f"✅ Customer {customer_id} stage updated: {old_stage} → {new_stage}")
         
         return jsonify({
             'message': 'Stage updated successfully',
-            'customer_id': customer.id,
+            'customer_id': customer_id,
             'old_stage': old_stage,
             'new_stage': new_stage,
             'stage_updated': True,
-            'notification_sent': notification_created,
-            'assignment_created': assignment_created
+            'notification_sent': notification_created
         }), 200
 
     except Exception as e:
         session.rollback()
-        current_app.logger.error(f"❌ Error updating customer {customer_id} stage: {e}")
+        current_app.logger.error(f"❌ Error updating customer stage: {e}")
         import traceback
         current_app.logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
 
-# ------------------ JOBS ------------------
 
-@db_bp.route('/jobs', methods=['GET', 'POST', 'OPTIONS'])
+# ==========================================
+# OPPORTUNITY/PROJECT STAGE UPDATES
+# ==========================================
+
+@db_bp.route('/projects/<int:project_id>/stage', methods=['PATCH', 'OPTIONS'])
 @token_required
-def handle_jobs():
+def update_project_stage(project_id):
+    """Update opportunity/project stage"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        if request.method == 'POST':
-            data = request.json
-            job = Job(
-                customer_id=data['customer_id'],
-                job_reference=data.get('job_reference'),
-                job_name=data.get('job_name'),
-                job_type=data.get('job_type', 'Kitchen'),
-                stage=data.get('stage', 'Lead'),
-                priority=data.get('priority', 'Medium'),
-                quote_price=data.get('quote_price'),
-                agreed_price=data.get('agreed_price'),
-                sold_amount=data.get('sold_amount'),
-                deposit1=data.get('deposit1'),
-                deposit2=data.get('deposit2'),
-                installation_address=data.get('installation_address'),
-                notes=data.get('notes'),
-                salesperson_name=data.get('salesperson_name'),
-                assigned_team_name=data.get('assigned_team_name'),
-                primary_fitter_name=data.get('primary_fitter_name')
-            )
-            
-            if data.get('delivery_date'):
-                job.delivery_date = datetime.strptime(data['delivery_date'], '%Y-%m-%d')
-            if data.get('measure_date'):
-                job.measure_date = datetime.strptime(data['measure_date'], '%Y-%m-%d')
-            if data.get('completion_date'):
-                job.completion_date = datetime.strptime(data['completion_date'], '%Y-%m-%d')
-            if data.get('deposit_due_date'):
-                job.deposit_due_date = datetime.strptime(data['deposit_due_date'], '%Y-%m-%d')
-            
-            session.add(job)
-            session.commit()
-            
-            return jsonify({'id': job.id, 'message': 'Job created successfully'}), 201
+        tenant_id = get_current_tenant_id()
+        employee_id = get_current_employee_id()
         
-        # GET all jobs (FIXED: Uses session.query)
-        jobs = session.query(Job).order_by(Job.created_at.desc()).all()
-        return jsonify([
-            {
-                'id': j.id,
-                'customer_id': j.customer_id,
-                'job_reference': j.job_reference,
-                'job_name': j.job_name,
-                'job_type': j.job_type,
-                'stage': j.stage,
-                'priority': j.priority,
-                'quote_price': float(j.quote_price) if j.quote_price else None,
-                'agreed_price': float(j.agreed_price) if j.agreed_price else None,
-                'sold_amount': float(j.sold_amount) if j.sold_amount else None,
-                'deposit1': float(j.deposit1) if j.deposit1 else None,
-                'deposit2': float(j.deposit2) if j.deposit2 else None,
-                'delivery_date': j.delivery_date.isoformat() if j.delivery_date else None,
-                'measure_date': j.measure_date.isoformat() if j.measure_date else None,
-                'completion_date': j.completion_date.isoformat() if j.completion_date else None,
-                'installation_address': j.installation_address,
-                'notes': j.notes,
-                'salesperson_name': j.salesperson_name,
-                'assigned_team_name': j.assigned_team_name,
-                'primary_fitter_name': j.primary_fitter_name,
-                'created_at': j.created_at.isoformat() if j.created_at else None,
-                'updated_at': j.updated_at.isoformat() if j.updated_at else None,
-            }
-            for j in jobs
-        ])
-    
-    except Exception as e:
-        session.rollback()
-        current_app.logger.error(f"Error handling jobs: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
-
-
-@db_bp.route('/jobs/<string:job_id>', methods=['GET', 'PUT', 'DELETE', 'OPTIONS'])
-@token_required
-def handle_single_job(job_id):
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-    
-    session = SessionLocal()
-    try:
-        # FIXED: Uses session.query
-        job = session.query(Job).filter_by(id=job_id).first()
-        if not job:
-            return jsonify({'error': 'Job not found'}), 404
+        # Get current stage
+        get_stage_query = text("""
+            SELECT 
+                o.process_stage,
+                o.opportunity_title,
+                o.client_id,
+                c.client_company_name,
+                c.client_contact_name
+            FROM "StreemLyne_MT"."Opportunity_Details" o
+            JOIN "StreemLyne_MT"."Client_Master" c ON o.client_id = c.client_id
+            WHERE o.opportunity_id = :opportunity_id AND o.tenant_id = :tenant_id
+        """)
         
-        if request.method == 'GET':
-            return jsonify({
-                'id': job.id,
-                'customer_id': job.customer_id,
-                'job_reference': job.job_reference,
-                'job_name': job.job_name,
-                'job_type': job.job_type,
-                'stage': job.stage,
-                'priority': job.priority,
-                'quote_price': float(job.quote_price) if job.quote_price else None,
-                'agreed_price': float(job.agreed_price) if job.agreed_price else None,
-                'sold_amount': float(job.sold_amount) if job.sold_amount else None,
-                'deposit1': float(job.deposit1) if job.deposit1 else None,
-                'deposit2': float(job.deposit2) if job.deposit2 else None,
-                'delivery_date': job.delivery_date.isoformat() if job.delivery_date else None,
-                'measure_date': job.measure_date.isoformat() if job.measure_date else None,
-                'completion_date': job.completion_date.isoformat() if job.completion_date else None,
-                'deposit_due_date': job.deposit_due_date.isoformat() if job.deposit_due_date else None,
-                'installation_address': job.installation_address,
-                'notes': job.notes,
-                'salesperson_name': job.salesperson_name,
-                'assigned_team_name': job.assigned_team_name,
-                'primary_fitter_name': job.primary_fitter_name,
-                'created_at': job.created_at.isoformat() if job.created_at else None,
-                'updated_at': job.updated_at.isoformat() if job.updated_at else None,
-            })
+        result = session.execute(get_stage_query, {
+            'opportunity_id': project_id,
+            'tenant_id': tenant_id
+        })
+        opp = result.fetchone()
         
-        elif request.method == 'PUT':
-            data = request.json
-            
-            job.job_reference = data.get('job_reference', job.job_reference)
-            job.job_name = data.get('job_name', job.job_name)
-            job.job_type = data.get('job_type', job.job_type)
-            job.stage = data.get('stage', job.stage)
-            job.priority = data.get('priority', job.priority)
-            job.quote_price = data.get('quote_price', job.quote_price)
-            job.agreed_price = data.get('agreed_price', job.agreed_price)
-            job.sold_amount = data.get('sold_amount', job.sold_amount)
-            job.deposit1 = data.get('deposit1', job.deposit1)
-            job.deposit2 = data.get('deposit2', job.deposit2)
-            job.installation_address = data.get('installation_address', job.installation_address)
-            job.notes = data.get('notes', job.notes)
-            job.salesperson_name = data.get('salesperson_name', job.salesperson_name)
-            job.assigned_team_name = data.get('assigned_team_name', job.assigned_team_name)
-            job.primary_fitter_name = data.get('primary_fitter_name', job.primary_fitter_name)
-            
-            if 'delivery_date' in data and data['delivery_date']:
-                job.delivery_date = datetime.strptime(data['delivery_date'], '%Y-%m-%d')
-            if 'measure_date' in data and data['measure_date']:
-                job.measure_date = datetime.strptime(data['measure_date'], '%Y-%m-%d')
-            if 'completion_date' in data and data['completion_date']:
-                job.completion_date = datetime.strptime(data['completion_date'], '%Y-%m-%d')
-            if 'deposit_due_date' in data and data['deposit_due_date']:
-                job.deposit_due_date = datetime.strptime(data['deposit_due_date'], '%Y-%m-%d')
-            
-            session.commit()
-            
-            return jsonify({'message': 'Job updated successfully'})
-        
-        elif request.method == 'DELETE':
-            customer_id = job.customer_id
-            session.delete(job)
-            session.commit()
-            
-            # Re-fetch customer to update stage after job deletion (FIXED: Uses session.query)
-            customer = session.query(Customer).filter_by(id=customer_id).first()
-            if customer:
-                # Update customer stage based on remaining jobs/projects if model supports it
-                pass 
-            
-            return jsonify({'message': 'Job deleted successfully'})
-
-    except Exception as e:
-        session.rollback()
-        current_app.logger.error(f"Error handling single job {job_id}: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
-
-
-@db_bp.route('/jobs/<string:job_id>/stage', methods=['PATCH', 'OPTIONS'])
-@token_required
-def update_job_stage(job_id):
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-    session = SessionLocal()
-    try:
-        job = session.query(Job).filter_by(id=job_id).first()
-        if not job:
-            return jsonify({'error': 'Job not found'}), 404
+        if not opp:
+            return jsonify({'error': 'Project not found'}), 404
 
         data = request.json
-        updated_by_user = get_current_user_email(data)
         new_stage = _extract_stage_from_payload(data)
-        reason = data.get('reason', 'Stage updated via drag and drop')
+        
         if not new_stage:
             return jsonify({'error': 'Stage is required'}), 400
 
         if new_stage not in PIPELINE_STAGE_ORDER:
             return jsonify({'error': 'Invalid stage'}), 400
 
-        old_stage = job.stage
+        old_stage = opp.process_stage or 'Not Started'
+        
         if old_stage == new_stage:
             return jsonify({
                 'message': 'Stage not changed',
-                'job_id': job.id,
+                'project_id': project_id,
                 'new_stage': new_stage
             }), 200
 
-        # Update job stage
-        job.stage = new_stage
-        job.updated_at = datetime.utcnow()
-        note_entry = f"\n[{datetime.utcnow().isoformat()}] Stage changed from {old_stage} to {new_stage} by {updated_by_user}. Reason: {reason}"
-        job.notes = (job.notes or '') + note_entry
+        # Update opportunity stage
+        update_query = text("""
+            UPDATE "StreemLyne_MT"."Opportunity_Details"
+            SET process_stage = :stage,
+                process_stage_updated_at = :updated_at,
+                process_stage_updated_by = :updated_by
+            WHERE opportunity_id = :opportunity_id AND tenant_id = :tenant_id
+        """)
+        
+        session.execute(update_query, {
+            'stage': new_stage,
+            'updated_at': datetime.utcnow(),
+            'updated_by': employee_id,
+            'opportunity_id': project_id,
+            'tenant_id': tenant_id
+        })
+        
+        # Create notification for important stages
+        if new_stage in ['Accepted', 'Production', 'Delivery', 'Installation', 'Complete']:
+            try:
+                stage_emoji = {
+                    'Accepted': '✅',
+                    'Production': '🏭',
+                    'Delivery': '🚚',
+                    'Installation': '🔧',
+                    'Complete': '🎉'
+                }
+                
+                client_name = opp.client_company_name or opp.client_contact_name
+                emoji = stage_emoji.get(new_stage, '🔄')
+                message = f"{emoji} Project '{opp.opportunity_title}' for {client_name} moved to {new_stage}"
+                
+                notify_query = text("""
+                    INSERT INTO "StreemLyne_MT"."Notification_Master" (
+                        tenant_id,
+                        employee_id,
+                        client_id,
+                        contract_id,
+                        notification_type,
+                        priority,
+                        message,
+                        read,
+                        dismissed
+                    ) VALUES (
+                        :tenant_id,
+                        :employee_id,
+                        :client_id,
+                        :contract_id,
+                        :notification_type,
+                        :priority,
+                        :message,
+                        false,
+                        false
+                    )
+                """)
+                
+                session.execute(notify_query, {
+                    'tenant_id': tenant_id,
+                    'employee_id': employee_id,
+                    'client_id': opp.client_id,
+                    'contract_id': project_id,
+                    'notification_type': 'stage_change',
+                    'priority': 'high' if new_stage == 'Accepted' else 'medium',
+                    'message': message
+                })
+                
+                current_app.logger.info(f"📢 Created {new_stage} notification for project {project_id}")
+                
+            except Exception as notif_error:
+                current_app.logger.warning(f"⚠️ Failed to create notification: {notif_error}")
 
-        # Add notification if moving to Accepted
-        if new_stage == 'Accepted':
-            notification = ProductionNotification(
-                job_id=job.id,
-                customer_id=job.customer_id,
-                message=f"Job '{job.job_name or job.job_reference or job.id}' moved to Accepted",
-                moved_by=updated_by_user
-            )
-            session.add(notification)
-
-            from datetime import timedelta
-            
-            customer = session.query(Customer).filter_by(id=job.customer_id).first()
-            customer_name = customer.name if customer else "Unknown Customer"
-            
-            assignment = Assignment(
-                id=str(uuid.uuid4()),
-                type='job',  # ✅ Valid enum value
-                title=f"Order materials for {customer_name}",
-                date=(datetime.utcnow() + timedelta(days=1)).date(),
-                team_member='Production Team',
-                customer_id=job.customer_id,
-                job_id=job.id,
-                notes=f"Order all necessary materials for {customer_name}'s project",
-                priority='High',
-                status='Scheduled',
-                created_by=None,
-                created_at=datetime.utcnow()
-            )
-            session.add(assignment)
-            assignment_created = True
-            current_app.logger.info(f"📋 Created material order assignment for job {job.id}")
-
-        # Simplified customer sync logic
-        customer = session.query(Customer).filter_by(id=job.customer_id).first()
-        if customer:
-            job_count = session.query(Job).filter_by(customer_id=job.customer_id).count()
-            project_count = session.query(Project).filter_by(customer_id=job.customer_id).count()
-            total_linked = job_count + project_count
-            
-            if total_linked <= 1 and customer.stage != new_stage:
-                customer.stage = new_stage
-                customer.updated_at = datetime.utcnow()
-
-        # 🔑 CRITICAL FIX: Flush, commit, then refresh
-        session.flush()
         session.commit()
-        session.refresh(job)
-
-        current_app.logger.info(f"✅ Job {job.id} stage updated from {old_stage} to {new_stage}")
 
         return jsonify({
             'message': 'Stage updated successfully',
-            'job_id': job.id,
+            'project_id': project_id,
             'old_stage': old_stage,
             'new_stage': new_stage
         }), 200
 
     except Exception as e:
         session.rollback()
-        current_app.logger.error(f"❌ Error updating job stage: {e}")
-        import traceback
-        current_app.logger.error(traceback.format_exc())
+        current_app.logger.error(f"Error updating project stage: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
 
 
-# ------------------ PIPELINE ------------------
+# ==========================================
+# PIPELINE DATA
+# ==========================================
 
 @db_bp.route('/pipeline', methods=['GET', 'OPTIONS'])
 @token_required
 def get_pipeline_data():
-    """Get all pipeline items
-    
-    ✅ NOTE: Only PROJECTS have stages. Jobs are created when projects reach Accepted/Production.
-    ✅ CRITICAL: We must return the ACTUAL database stage values, not computed ones
-    """
+    """Get all pipeline items (clients and opportunities)"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
+        tenant_id = get_current_tenant_id()
+        
         current_app.logger.info("📊 Fetching pipeline data...")
         
-        # Eagerly load relationships to avoid lazy loading issues
-        customers = session.query(Customer).options(
-            selectinload(Customer.projects)
-        ).all()
-
-        pipeline_items = []
+        # Get all clients with their opportunities
+        query = text("""
+            SELECT 
+                c.client_id,
+                c.client_company_name,
+                c.client_contact_name,
+                c.client_phone,
+                c.client_email,
+                c.address,
+                c.post_code,
+                c.stage as client_stage,
+                c.created_at as client_created_at,
+                o.opportunity_id,
+                o.opportunity_title,
+                o.process_stage,
+                o.created_at as opp_created_at
+            FROM "StreemLyne_MT"."Client_Master" c
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" o 
+                ON c.client_id = o.client_id AND o.deleted_at IS NULL
+            WHERE c.tenant_id = :tenant_id
+            AND c.is_deleted = false
+            ORDER BY c.created_at DESC, o.created_at DESC
+        """)
         
-        # ✅ DEBUG: Track what we're processing
-        customers_with_projects = 0
-        customers_without_projects = 0
+        result = session.execute(query, {'tenant_id': tenant_id})
+        rows = result.fetchall()
+        
+        # Group by client
+        clients_map = {}
+        for row in rows:
+            client_id = row.client_id
+            
+            if client_id not in clients_map:
+                clients_map[client_id] = {
+                    'id': client_id,
+                    'name': row.client_company_name or row.client_contact_name,
+                    'phone': row.client_phone or '',
+                    'email': row.client_email or '',
+                    'address': row.address or '',
+                    'postcode': row.post_code or '',
+                    'stage': row.client_stage or 'Lead',
+                    'created_at': row.client_created_at.isoformat() if row.client_created_at else None,
+                    'opportunities': []
+                }
+            
+            # Add opportunity if exists
+            if row.opportunity_id:
+                clients_map[client_id]['opportunities'].append({
+                    'id': row.opportunity_id,
+                    'title': row.opportunity_title,
+                    'stage': row.process_stage or 'Not Started',
+                    'created_at': row.opp_created_at.isoformat() if row.opp_created_at else None
+                })
+        
+        # Build pipeline items
+        pipeline_items = []
         total_projects = 0
-
-        for customer in customers:
-            customer_projects = customer.projects 
-            has_projects = bool(customer_projects)
-
-            # ✅ Generate a card for *every* Project (projects have stages)
-            for project in customer_projects:
-                total_projects += 1
-                project_stage = project.stage or 'Lead'  # ✅ Store stage value
-                
-                current_app.logger.debug(
-                    f"  📋 Project: {project.project_name} | "
-                    f"Customer: {customer.name} | "
-                    f"Stage: {project_stage}"
-                )
-                
+        clients_with_projects = 0
+        clients_without_projects = 0
+        
+        for client_data in clients_map.values():
+            has_opportunities = len(client_data['opportunities']) > 0
+            
+            if has_opportunities:
+                clients_with_projects += 1
+                # Create item for each opportunity
+                for opp in client_data['opportunities']:
+                    total_projects += 1
+                    pipeline_items.append({
+                        'id': f"project-{opp['id']}",
+                        'type': 'project',
+                        'stage': opp['stage'],
+                        'customer': {
+                            'id': client_data['id'],
+                            'name': client_data['name'],
+                            'phone': client_data['phone'],
+                            'email': client_data['email'],
+                            'address': client_data['address'],
+                            'postcode': client_data['postcode']
+                        },
+                        'project': {
+                            'id': opp['id'],
+                            'customer_id': client_data['id'],
+                            'project_name': opp['title'],
+                            'stage': opp['stage'],
+                            'created_at': opp['created_at']
+                        }
+                    })
+            else:
+                clients_without_projects += 1
+                # Client with no opportunities - pure lead
                 pipeline_items.append({
-                    'id': f'project-{project.id}',
-                    'type': 'project',
-                    'customer': customer.to_dict(include_projects=False),
-                    'stage': project_stage,  # ✅ Use stored value
-                    'project': {
-                        'id': project.id,
-                        'customer_id': customer.id,
-                        'project_name': project.project_name or 'Unnamed Project',
-                        'project_type': project.project_type or 'Unknown',
-                        # 'job_name': project.project_name or 'Unnamed Project',
-                        # 'job_type': project.project_type or 'Unknown', 
-                        'stage': project_stage,  # ✅ Use stored value
-                        'date_of_measure': project.date_of_measure.isoformat() if project.date_of_measure else None,
-                        'notes': project.notes,
-                        'created_at': project.created_at.isoformat() if project.created_at else None,
-                        'updated_at': project.updated_at.isoformat() if project.updated_at else None,
+                    'id': f"customer-{client_data['id']}",
+                    'type': 'customer',
+                    'stage': client_data['stage'],
+                    'customer': {
+                        'id': client_data['id'],
+                        'name': client_data['name'],
+                        'phone': client_data['phone'],
+                        'email': client_data['email'],
+                        'address': client_data['address'],
+                        'postcode': client_data['postcode'],
+                        'created_at': client_data['created_at']
                     }
                 })
-
-            # ✅ Case: Customer is a pure Lead (no projects yet)
-            if not has_projects:
-                customers_without_projects += 1
-                customer_stage = customer.stage or 'Lead'  # ✅ Store stage value
-                
-                current_app.logger.debug(
-                    f"  👤 Customer (no projects): {customer.name} | "
-                    f"Stage: {customer_stage}"
-                )
-                
-                pipeline_items.append({
-                    'id': f'customer-{customer.id}',
-                    'type': 'customer',
-                    'stage': customer_stage,  # ✅ Use stored value
-                    'customer': customer.to_dict(include_projects=False)
-                })
-            else:
-                customers_with_projects += 1
         
-        # ✅ ENHANCED LOGGING
         current_app.logger.info(f"✅ Pipeline data fetched: {len(pipeline_items)} items")
         current_app.logger.info(
-            f"   📊 Breakdown: {customers_with_projects} customers with projects ({total_projects} projects), "
-            f"{customers_without_projects} customers without projects"
+            f"   📊 Breakdown: {clients_with_projects} clients with projects ({total_projects} projects), "
+            f"{clients_without_projects} clients without projects"
         )
         
-        # Log stage distribution for debugging
+        # Log stage distribution
         stage_counts = {}
         for item in pipeline_items:
             stage = item.get('stage', 'Unknown')
@@ -663,308 +489,110 @@ def get_pipeline_data():
     finally:
         session.close()
 
-# ------------------ PROJECTS ROUTES (New/Updated) ------------------
 
-@db_bp.route('/projects/<string:project_id>', methods=['GET', 'PUT', 'DELETE', 'OPTIONS'])
+# ==========================================
+# PROJECT/OPPORTUNITY CRUD
+# ==========================================
+
+@db_bp.route('/projects/<int:project_id>', methods=['GET', 'PUT', 'DELETE', 'OPTIONS'])
 @token_required
 def handle_single_project(project_id):
+    """Handle single project/opportunity operations"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        project = session.query(Project).filter_by(id=project_id).first()
-        if not project:
-            return jsonify({'error': 'Project not found'}), 404
+        tenant_id = get_current_tenant_id()
         
         if request.method == 'GET':
-            return jsonify(project.to_dict())
+            query = text("""
+                SELECT 
+                    o.opportunity_id,
+                    o.opportunity_title,
+                    o.process_stage,
+                    o.created_at,
+                    o.client_id,
+                    c.client_company_name,
+                    c.client_contact_name
+                FROM "StreemLyne_MT"."Opportunity_Details" o
+                JOIN "StreemLyne_MT"."Client_Master" c ON o.client_id = c.client_id
+                WHERE o.opportunity_id = :opportunity_id AND o.tenant_id = :tenant_id
+            """)
+            
+            result = session.execute(query, {
+                'opportunity_id': project_id,
+                'tenant_id': tenant_id
+            })
+            opp = result.fetchone()
+            
+            if not opp:
+                return jsonify({'error': 'Project not found'}), 404
+            
+            return jsonify({
+                'id': opp.opportunity_id,
+                'project_name': opp.opportunity_title,
+                'stage': opp.process_stage or 'Not Started',
+                'created_at': opp.created_at.isoformat() if opp.created_at else None,
+                'customer_id': opp.client_id,
+                'customer_name': opp.client_company_name or opp.client_contact_name
+            })
 
         elif request.method == 'PUT':
             data = request.json
-            old_stage = project.stage
-
-            # Update attributes (ensuring 'stage' is included for drag-and-drop fix)
-            project.project_name = data.get('project_name', project.project_name)
-            project.project_type = data.get('project_type', project.project_type)
-            project.stage = data.get('stage', project.stage) # CRITICAL: Update stage here
-            project.notes = data.get('notes', project.notes)
-            project.updated_by = get_current_user_email(data)
-            project.updated_at = datetime.utcnow()
-
-            if 'date_of_measure' in data and data['date_of_measure']:
-                if isinstance(data['date_of_measure'], str):
-                    project.date_of_measure = datetime.strptime(data['date_of_measure'], '%Y-%m-%d').date()
-                elif isinstance(data['date_of_measure'], date):
-                    project.date_of_measure = data['date_of_measure']
             
-            # Optionally sync customer stage if this is the only linked entity
-            customer = project.customer
-            new_stage = project.stage
-            if customer:
-                # Check for other jobs/projects linked to the customer
-                job_count = session.query(Job).filter_by(customer_id=customer.id).count()
-                # Exclude the current project from the count of linked projects
-                total_linked = job_count + len([p for p in customer.projects if p.id != project.id])
-                
-                if total_linked == 0 and customer.stage != new_stage:
-                    customer.stage = new_stage
-                    customer.updated_at = datetime.utcnow()
-                    note_entry_cust = f"\n[{datetime.utcnow().isoformat()}] Stage synced from {old_stage} to {new_stage} by {project.updated_by}. Reason: Linked project moved."
-                    customer.notes = (customer.notes or '') + note_entry_cust
-                    session.add(customer)
-
-            # ✅ FIX: Commit BEFORE refresh (Ensures persistence)
+            update_fields = []
+            params = {'opportunity_id': project_id, 'tenant_id': tenant_id}
+            
+            if 'project_name' in data:
+                update_fields.append('opportunity_title = :title')
+                params['title'] = data['project_name']
+            
+            if 'stage' in data:
+                update_fields.append('process_stage = :stage')
+                params['stage'] = data['stage']
+            
+            if not update_fields:
+                return jsonify({'error': 'No fields to update'}), 400
+            
+            update_query = text(f"""
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET {', '.join(update_fields)}, process_stage_updated_at = :updated_at
+                WHERE opportunity_id = :opportunity_id AND tenant_id = :tenant_id
+                RETURNING process_stage
+            """)
+            
+            params['updated_at'] = datetime.utcnow()
+            
+            result = session.execute(update_query, params)
+            new_stage_row = result.fetchone()
             session.commit()
             
-            # 🔑 FIX: Refresh the object to ensure the latest state is captured 
-            session.refresh(project)
-            
-            return jsonify({'message': 'Project updated successfully', 'id': project.id, 'new_stage': project.stage}) # 🔑 FIX: Use project.stage (refreshed value)
+            return jsonify({
+                'message': 'Project updated successfully',
+                'id': project_id,
+                'new_stage': new_stage_row[0] if new_stage_row else None
+            })
 
         elif request.method == 'DELETE':
-            session.delete(project)
+            delete_query = text("""
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET deleted_at = :deleted_at
+                WHERE opportunity_id = :opportunity_id AND tenant_id = :tenant_id
+            """)
+            
+            session.execute(delete_query, {
+                'deleted_at': datetime.utcnow(),
+                'opportunity_id': project_id,
+                'tenant_id': tenant_id
+            })
             session.commit()
+            
             return jsonify({'message': 'Project deleted successfully'})
 
     except Exception as e:
         session.rollback()
-        current_app.logger.error(f"Error handling single project {project_id}: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
-
-
-@db_bp.route('/projects/<string:project_id>/stage', methods=['PATCH', 'OPTIONS'])
-@token_required
-def update_project_stage(project_id):
-    """Update project stage - ENHANCED VERSION with all important stage notifications"""
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-    
-    session = SessionLocal()
-    try:
-        project = session.query(Project).filter_by(id=project_id).first()
-        if not project:
-            return jsonify({'error': 'Project not found'}), 404
-
-        data = request.json
-        updated_by_user = get_current_user_email(data)
-        new_stage = _extract_stage_from_payload(data)
-        reason = data.get('reason', 'Stage updated via drag and drop')
-        
-        if not new_stage:
-            return jsonify({'error': 'Stage is required'}), 400
-
-        if new_stage not in PIPELINE_STAGE_ORDER:
-            return jsonify({'error': 'Invalid stage'}), 400
-
-        old_stage = project.stage
-        if old_stage == new_stage:
-            return jsonify({
-                'message': 'Stage not changed',
-                'project_id': project.id,
-                'new_stage': new_stage
-            }), 200
-
-        project.stage = new_stage
-        project.updated_by = updated_by_user
-        project.updated_at = datetime.utcnow()
-        note_entry = f"\n[{datetime.utcnow().isoformat()}] Stage changed from {old_stage} to {new_stage} by {updated_by_user}. Reason: {reason}"
-        project.notes = (project.notes or '') + note_entry
-
-        # ✅ ENHANCED: Create notifications for all important stages
-        try:
-            from backend.routes.notification_routes import create_activity_notification
-            
-            project_display_name = project.project_name or f"Project #{project.id[:8]}"
-            customer_name = project.customer.name if project.customer else "Unknown Customer"
-            
-            # Define stage-specific notification messages for projects
-            stage_notifications = {
-                'Accepted': {
-                    'emoji': '✅',
-                    'message': f"Project '{project_display_name}' for {customer_name} has been accepted",
-                },
-                'Production': {
-                    'emoji': '🏭',
-                    'message': f"Project '{project_display_name}' for {customer_name} is now in Production",
-                },
-                'Delivery': {
-                    'emoji': '🚚',
-                    'message': f"🚚 Project '{project_display_name}' for {customer_name} is ready for delivery!",
-                },
-                'Installation': {
-                    'emoji': '🔧',
-                    'message': f"Installation started for project '{project_display_name}' - {customer_name}",
-                },
-                'Complete': {
-                    'emoji': '🎉',
-                    'message': f"🎉 Project '{project_display_name}' for {customer_name} has been COMPLETED!",
-                }
-            }
-            
-            # Create notification if it's an important stage
-            if new_stage in stage_notifications:
-                stage_config = stage_notifications[new_stage]
-                
-                create_activity_notification(
-                    session=session,
-                    message=stage_config['message'],
-                    job_id=None,
-                    customer_id=project.customer_id,
-                    moved_by=updated_by_user
-                )
-                current_app.logger.info(f"📢 Created {new_stage} notification for project {project.id}")
-                
-        except Exception as notif_error:
-            current_app.logger.warning(f"⚠️ Failed to create notification: {notif_error}")
-
-        session.flush()
-        session.commit()
-        session.refresh(project)
-
-        # Simplified customer sync
-        customer = project.customer
-        if customer:
-            job_count = session.query(Job).filter_by(customer_id=customer.id).count()
-            other_projects = [p for p in customer.projects if p.id != project.id]
-            total_linked = job_count + len(other_projects)
-
-            if total_linked == 0 and customer.stage != new_stage:
-                customer.stage = new_stage
-                customer.updated_at = datetime.utcnow()
-
-        session.commit()
-
-        return jsonify({
-            'message': 'Stage updated successfully',
-            'project_id': project.id,
-            'old_stage': old_stage,
-            'new_stage': new_stage
-        }), 200
-
-    except Exception as e:
-        session.rollback()
-        current_app.logger.error(f"Error updating project stage: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
-
-# ------------------ ASSIGNMENTS ------------------
-
-@db_bp.route('/assignments', methods=['GET', 'POST', 'OPTIONS'])
-@token_required
-def handle_assignments():
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-
-    session = SessionLocal()
-    try:
-        if request.method == 'POST':
-            data = request.json
-            
-            # ✅ Create assignment with proper fields
-            assignment = Assignment(
-                id=data.get('id') or str(uuid.uuid4()),
-                type=data.get('type', 'job'),
-                title=data.get('title', ''),
-                date=datetime.strptime(data['date'], '%Y-%m-%d').date() if data.get('date') else None,
-                start_date=data.get('start_date'),
-                end_date=data.get('end_date'),
-                start_time=data.get('start_time'),
-                end_time=data.get('end_time'),
-                estimated_hours=data.get('estimated_hours'),
-                notes=data.get('notes'),
-                priority=data.get('priority', 'Medium'),
-                status=data.get('status', 'Scheduled'),
-                user_id=data.get('user_id'),
-                team_member=data.get('team_member'),
-                job_id=data.get('job_id'),
-                customer_id=data.get('customer_id'),
-                customer_name=data.get('customer_name'),
-                job_type=data.get('job_type'),
-                created_by=data.get('created_by'),
-                created_at=datetime.utcnow()
-            )
-            session.add(assignment)
-            session.commit()
-            session.refresh(assignment)
-            
-            return jsonify(assignment.to_dict()), 201
-
-        # GET - Filter by user role
-        try:
-            current_user_role = request.current_user.role if hasattr(request, 'current_user') else None
-            current_user_id = request.current_user.id if hasattr(request, 'current_user') else None
-            current_user_name = request.current_user.full_name if hasattr(request, 'current_user') else None
-            
-            # ✅ Get all assignments first
-            all_assignments = session.query(Assignment).order_by(Assignment.date.asc()).all()
-            
-            # ✅ Filter based on role
-            if current_user_role == 'Production':
-                # Production users see assignments for "Production Team"
-                assignments = [a for a in all_assignments if a.team_member == 'Production Team']
-            elif current_user_role == 'Manager' or current_user_role == 'Sales':
-                # Managers and Sales see all assignments
-                assignments = all_assignments
-            else:
-                # Other roles see assignments assigned to them (by user_id OR team_member matching their name)
-                assignments = [
-                    a for a in all_assignments 
-                    if (hasattr(a, 'user_id') and a.user_id == current_user_id) or 
-                       (a.team_member and current_user_name and a.team_member.lower() == current_user_name.lower())
-                ]
-            
-            return jsonify([a.to_dict() for a in assignments])
-            
-        except Exception as filter_error:
-            # If filtering fails, return all assignments for managers, empty for others
-            current_app.logger.warning(f"Assignment filtering failed: {filter_error}")
-            if current_user_role in ['Manager', 'Sales']:
-                assignments = session.query(Assignment).order_by(Assignment.date.asc()).all()
-                return jsonify([a.to_dict() for a in assignments])
-            else:
-                return jsonify([])
-        
-    except Exception as e:
-        session.rollback()
-        current_app.logger.error(f"Error in /assignments: {e}")
-        import traceback
-        current_app.logger.error(traceback.format_exc())
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
-
-# ------------------ FITTERS ------------------
-
-@db_bp.route('/fitters', methods=['GET', 'POST', 'OPTIONS'])
-@token_required
-def handle_fitters():
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-
-    session = SessionLocal()
-    try:
-        if request.method == 'POST':
-            data = request.json
-            fitter = Fitter(
-                name=data.get('name', ''),
-                email=data.get('email'),
-                phone=data.get('phone'),
-                created_by=get_current_user_email(data)
-            )
-            session.add(fitter)
-            session.commit()
-            return jsonify({'id': fitter.id, 'message': 'Fitter created successfully'}), 201
-
-        # FIXED: Uses session.query
-        fitters = session.query(Fitter).order_by(Fitter.created_at.desc()).all()
-        return jsonify([f.to_dict() for f in fitters])
-    except Exception as e:
-        session.rollback()
-        current_app.logger.error(f"Error in /fitters: {e}")
+        current_app.logger.error(f"Error handling project {project_id}: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()

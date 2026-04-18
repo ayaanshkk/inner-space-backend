@@ -1,18 +1,27 @@
+"""
+Assignment Routes - Adapted for StreemLyne_MT schema
+Manages scheduling and task assignments
+"""
 from flask import Blueprint, request, jsonify, current_app
 from datetime import datetime
-from ..models import User, Assignment, Job, Customer
-from .auth_routes import token_required
+from sqlalchemy import text
 from ..db import SessionLocal
+from .auth_helpers import (
+    token_required, 
+    get_current_tenant_id, 
+    get_current_employee_id
+)
 
 assignment_bp = Blueprint('assignments', __name__)
 
-# ✅ VALID ASSIGNMENT FIELDS - Added start_date, end_date, customer_name
+# Valid assignment fields based on StreemLyne schema
 VALID_ASSIGNMENT_FIELDS = [
     'type', 'title', 'date', 'start_date', 'end_date', 'customer_name',
-    'user_id', 'team_member', 'job_id', 'customer_id', 'job_type',
-    'start_time', 'end_time', 'estimated_hours',
+    'assigned_employee_id', 'team_member', 'opportunity_id', 'client_id', 
+    'job_type', 'start_time', 'end_time', 'estimated_hours',
     'notes', 'priority', 'status'
 ]
+
 
 def filter_assignment_data(data):
     """Filter request data to only include valid Assignment fields"""
@@ -22,23 +31,30 @@ def filter_assignment_data(data):
             filtered[key] = data[key]
     return filtered
 
+
 @assignment_bp.route('/assignments', methods=['GET', 'POST'])
 @token_required
 def handle_assignments():
-    current_user = request.current_user
+    """Handle assignments (stored in Notification_Master as tasks)"""
     
     if request.method == 'POST':
         session = SessionLocal()
         
         try:
+            tenant_id = get_current_tenant_id()
+            employee_id = get_current_employee_id()
+            
+            if not tenant_id:
+                return jsonify({'error': 'Tenant ID not found in session'}), 401
+            
             data = request.json
             current_app.logger.info(f"📥 RAW data received: {data}")
             
-            # ✅ CRITICAL: Filter out invalid fields like 'description'
+            # Filter out invalid fields
             data = filter_assignment_data(data)
             current_app.logger.info(f"📥 Creating assignment with filtered data: {data}")
             
-            # ✅ PARSE DATE FIELDS - Handle both old and new format
+            # Parse date fields
             date_value = None
             start_date_value = None
             end_date_value = None
@@ -46,14 +62,14 @@ def handle_assignments():
             if data.get('start_date'):
                 try:
                     start_date_value = datetime.strptime(data['start_date'], '%Y-%m-%d').date()
-                    date_value = start_date_value  # Also set date for backward compatibility
+                    date_value = start_date_value
                 except Exception as e:
                     current_app.logger.error(f"❌ Error parsing start_date: {e}")
                     return jsonify({'error': 'Invalid start_date format'}), 400
             elif data.get('date'):
                 try:
                     date_value = datetime.strptime(data['date'], '%Y-%m-%d').date()
-                    start_date_value = date_value  # Also set start_date
+                    start_date_value = date_value
                 except Exception as e:
                     current_app.logger.error(f"❌ Error parsing date: {e}")
                     return jsonify({'error': 'Invalid date format'}), 400
@@ -67,15 +83,25 @@ def handle_assignments():
                     current_app.logger.error(f"❌ Error parsing end_date: {e}")
                     return jsonify({'error': 'Invalid end_date format'}), 400
             else:
-                end_date_value = start_date_value  # Default: end_date = start_date
+                end_date_value = start_date_value
             
-            # ✅ GET CUSTOMER NAME
+            # Get customer name
             customer_name = data.get('customer_name')
-            customer_id = data.get('customer_id')
-            if customer_id and not customer_name:
-                customer = session.query(Customer).filter_by(id=customer_id).first()
-                if customer:
-                    customer_name = customer.name
+            client_id = data.get('client_id')
+            
+            if client_id and not customer_name:
+                client_query = text("""
+                    SELECT client_company_name, client_contact_name
+                    FROM "StreemLyne_MT"."Client_Master"
+                    WHERE client_id = :client_id AND tenant_id = :tenant_id
+                """)
+                result = session.execute(client_query, {
+                    'client_id': client_id,
+                    'tenant_id': tenant_id
+                })
+                client = result.fetchone()
+                if client:
+                    customer_name = client.client_company_name or client.client_contact_name
             
             # Parse times if provided
             start_time = None
@@ -99,72 +125,111 @@ def handle_assignments():
                     estimated_hours = float(estimated_hours) if estimated_hours else None
                 except ValueError:
                     estimated_hours = None
-
-            # Get assigned user info
-            user_id = data.get('user_id')
+            
+            # Get assigned employee info
+            assigned_employee_id = data.get('assigned_employee_id')
             team_member_name = data.get('team_member')
             
-            if user_id and not team_member_name:
-                assigned_user = session.get(User, user_id) 
-                if assigned_user:
-                    team_member_name = assigned_user.full_name
-                else:
-                    current_app.logger.warning(f"User {user_id} not found")
+            if assigned_employee_id and not team_member_name:
+                emp_query = text("""
+                    SELECT employee_name
+                    FROM "StreemLyne_MT"."Employee_Master"
+                    WHERE employee_id = :employee_id AND tenant_id = :tenant_id
+                """)
+                result = session.execute(emp_query, {
+                    'employee_id': assigned_employee_id,
+                    'tenant_id': tenant_id
+                })
+                emp = result.fetchone()
+                if emp:
+                    team_member_name = emp.employee_name
             
-            # Get creator info
-            creator = session.get(User, current_user.id)
-            created_by_name = creator.full_name if creator else None
-                
-            # ✅ Create assignment with date range support
-            assignment = Assignment(
-                type=data.get('type', 'job'),
-                title=data.get('title', ''),
-                date=date_value,
-                start_date=start_date_value,
-                end_date=end_date_value,
-                customer_name=customer_name,
-                user_id=user_id,
-                team_member=team_member_name,
-                created_by=current_user.id,
-                job_id=data.get('job_id'),
-                customer_id=customer_id,
-                start_time=start_time,
-                end_time=end_time,
-                estimated_hours=estimated_hours,
-                notes=data.get('notes', ''),
-                priority=data.get('priority', 'Medium'),
-                status=data.get('status', 'Scheduled'),
-                job_type=data.get('job_type')
-            )
+            # Build assignment message
+            assignment_type = data.get('type', 'task')
+            title = data.get('title', '')
+            priority = data.get('priority', 'medium').lower()
+            status = data.get('status', 'scheduled')
             
-            session.add(assignment)
+            message = f"{assignment_type.upper()}: {title}"
+            if customer_name:
+                message += f" - {customer_name}"
+            if start_time:
+                message += f" at {start_time.strftime('%H:%M')}"
+            if data.get('notes'):
+                message += f" | Notes: {data.get('notes')}"
+            
+            # Store as notification/task
+            insert_query = text("""
+                INSERT INTO "StreemLyne_MT"."Notification_Master" (
+                    tenant_id,
+                    employee_id,
+                    client_id,
+                    property_id,
+                    contract_id,
+                    notification_type,
+                    priority,
+                    message,
+                    read,
+                    dismissed,
+                    created_at
+                ) VALUES (
+                    :tenant_id,
+                    :employee_id,
+                    :client_id,
+                    :property_id,
+                    :contract_id,
+                    :notification_type,
+                    :priority,
+                    :message,
+                    false,
+                    false,
+                    :created_at
+                )
+                RETURNING notification_id
+            """)
+            
+            result = session.execute(insert_query, {
+                'tenant_id': tenant_id,
+                'employee_id': assigned_employee_id,
+                'client_id': client_id,
+                'property_id': data.get('property_id'),
+                'contract_id': data.get('opportunity_id'),
+                'notification_type': 'task',
+                'priority': priority,
+                'message': message,
+                'created_at': datetime.utcnow()
+            })
+            
+            notification_id = result.fetchone()[0]
             session.commit()
-            session.refresh(assignment)
-
-            current_app.logger.info(f"✅ Assignment created: {assignment.id}")
-
-            # Build response dict
-            result = assignment.to_dict()
             
-            # Add creator name if not already present
-            if 'created_by_name' not in result or not result['created_by_name']:
-                result['created_by_name'] = created_by_name
-
+            current_app.logger.info(f"✅ Assignment created: {notification_id}")
+            
+            # Build response
+            response = {
+                'id': notification_id,
+                'type': assignment_type,
+                'title': title,
+                'date': start_date_value.isoformat() if start_date_value else None,
+                'start_date': start_date_value.isoformat() if start_date_value else None,
+                'end_date': end_date_value.isoformat() if end_date_value else None,
+                'customer_name': customer_name,
+                'assigned_employee_id': assigned_employee_id,
+                'team_member': team_member_name,
+                'start_time': start_time.strftime('%H:%M') if start_time else None,
+                'end_time': end_time.strftime('%H:%M') if end_time else None,
+                'estimated_hours': estimated_hours,
+                'notes': data.get('notes'),
+                'priority': priority,
+                'status': status,
+                'created_at': datetime.utcnow().isoformat()
+            }
+            
             return jsonify({
                 'message': 'Assignment created successfully',
-                'assignment': result
+                'assignment': response
             }), 201
-
-        except KeyError as e:
-            session.rollback()
-            current_app.logger.error(f"Missing required field: {e}")
-            return jsonify({'error': f'Missing required field: {str(e)}'}), 400
-        except TypeError as e:
-            session.rollback()
-            current_app.logger.error(f"❌ TypeError (invalid field): {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({'error': f'Invalid field in request: {str(e)}'}), 400
+            
         except Exception as e:
             session.rollback()
             current_app.logger.error(f"Error creating assignment: {e}")
@@ -174,41 +239,78 @@ def handle_assignments():
         finally:
             session.close()
     
-    # ✅ GET - FIXED: Everyone sees ALL assignments
+    # GET - Fetch all assignments for tenant
     if request.method == 'GET':
         session = SessionLocal()
         try:
-            current_app.logger.info(f"📋 Fetching assignments for user: {current_user.full_name} (role: {current_user.role})")
+            tenant_id = get_current_tenant_id()
             
-            # ✅ CRITICAL FIX: Everyone sees ALL assignments (no role filtering)
-            assignments = session.query(Assignment).order_by(Assignment.date.desc()).all()
+            current_app.logger.info(f"📋 Fetching assignments for tenant: {tenant_id}")
             
-            current_app.logger.info(f"✅ Returning all {len(assignments)} assignments to {current_user.role}")
-
-            result = []
-            for a in assignments:
-                try:
-                    assignment_dict = a.to_dict()
-                    
-                    # Ensure creator and updater names are included
-                    if a.created_by and ('created_by_name' not in assignment_dict or not assignment_dict['created_by_name']):
-                        creator = session.get(User, a.created_by)
-                        if creator:
-                            assignment_dict['created_by_name'] = creator.full_name
-                    
-                    if a.updated_by and ('updated_by_name' not in assignment_dict or not assignment_dict['updated_by_name']):
-                        updater = session.get(User, a.updated_by)
-                        if updater:
-                            assignment_dict['updated_by_name'] = updater.full_name
-                    
-                    result.append(assignment_dict)
-                except Exception as dict_error:
-                    current_app.logger.error(f"Error converting assignment {a.id} to dict: {dict_error}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
+            # Query task-type notifications as assignments
+            query = text("""
+                SELECT 
+                    n.notification_id,
+                    n.notification_type,
+                    n.priority,
+                    n.message,
+                    n.created_at,
+                    n.read_at,
+                    n.employee_id,
+                    n.client_id,
+                    n.property_id,
+                    n.contract_id,
+                    e.employee_name as team_member,
+                    c.client_company_name,
+                    c.client_contact_name
+                FROM "StreemLyne_MT"."Notification_Master" n
+                LEFT JOIN "StreemLyne_MT"."Employee_Master" e ON n.employee_id = e.employee_id
+                LEFT JOIN "StreemLyne_MT"."Client_Master" c ON n.client_id = c.client_id
+                WHERE n.tenant_id = :tenant_id
+                AND n.notification_type = 'task'
+                AND n.dismissed = false
+                ORDER BY n.created_at DESC
+            """)
             
-            return jsonify(result)
+            result = session.execute(query, {'tenant_id': tenant_id})
+            notifications = result.fetchall()
+            
+            current_app.logger.info(f"✅ Returning {len(notifications)} assignments")
+            
+            assignments = []
+            for n in notifications:
+                # Parse message to extract details
+                # Message format: "TYPE: Title - Customer | Notes: ..."
+                message = n.message
+                parts = message.split(' | ')
+                main_part = parts[0] if parts else message
+                notes = parts[1].replace('Notes: ', '') if len(parts) > 1 else ''
+                
+                type_and_title = main_part.split(': ', 1)
+                assignment_type = type_and_title[0].lower() if len(type_and_title) > 1 else 'task'
+                title_customer = type_and_title[1] if len(type_and_title) > 1 else message
+                
+                title_parts = title_customer.split(' - ')
+                title = title_parts[0] if title_parts else title_customer
+                
+                assignments.append({
+                    'id': n.notification_id,
+                    'type': assignment_type,
+                    'title': title,
+                    'customer_name': n.client_company_name or n.client_contact_name,
+                    'assigned_employee_id': n.employee_id,
+                    'team_member': n.team_member,
+                    'client_id': n.client_id,
+                    'property_id': n.property_id,
+                    'opportunity_id': n.contract_id,
+                    'priority': n.priority,
+                    'status': 'completed' if n.read_at else 'scheduled',
+                    'notes': notes,
+                    'created_at': n.created_at.isoformat() if n.created_at else None
+                })
+            
+            return jsonify(assignments)
+            
         except Exception as e:
             current_app.logger.error(f"Error in GET assignments: {e}")
             import traceback
@@ -218,343 +320,256 @@ def handle_assignments():
             session.close()
 
 
-@assignment_bp.route('/assignments/<string:assignment_id>', methods=['GET', 'PUT', 'DELETE'])
+@assignment_bp.route('/assignments/<int:notification_id>', methods=['GET', 'PUT', 'DELETE'])
 @token_required
-def handle_single_assignment(assignment_id):
-    current_user = request.current_user
+def handle_single_assignment(notification_id):
+    """Handle single assignment operations"""
     
     session = SessionLocal()
     try:
-        assignment = session.get(Assignment, assignment_id) 
+        tenant_id = get_current_tenant_id()
+        employee_id = get_current_employee_id()
+        
+        # Verify assignment exists and belongs to tenant
+        verify_query = text("""
+            SELECT 
+                n.notification_id,
+                n.notification_type,
+                n.priority,
+                n.message,
+                n.employee_id,
+                n.client_id,
+                n.read,
+                n.dismissed
+            FROM "StreemLyne_MT"."Notification_Master" n
+            WHERE n.notification_id = :notification_id
+            AND n.tenant_id = :tenant_id
+            AND n.notification_type = 'task'
+        """)
+        
+        result = session.execute(verify_query, {
+            'notification_id': notification_id,
+            'tenant_id': tenant_id
+        })
+        assignment = result.fetchone()
         
         if not assignment:
-            current_app.logger.error(f"❌ Assignment {assignment_id} not found")
             return jsonify({'error': 'Assignment not found'}), 404
-        
-        # ✅ RELAXED Authorization: Anyone can view/update/delete (for drag & drop)
-        # Managers have full access, others can manage their own or unassigned tasks
-        if request.method in ['PUT', 'DELETE']:
-            is_manager = current_user.role == 'Manager'
-            is_assigned_user = assignment.user_id == current_user.id
-            is_creator = assignment.created_by == current_user.id
-            is_unassigned = not assignment.user_id
-            
-            # ✅ Allow if: Manager, assigned user, creator, or task is unassigned
-            if not (is_manager or is_assigned_user or is_creator or is_unassigned):
-                return jsonify({'error': 'Unauthorized access to assignment'}), 403
         
         # GET
         if request.method == 'GET':
-            result = assignment.to_dict()
-            
-            # Add user names if not present
-            if assignment.created_by and ('created_by_name' not in result or not result['created_by_name']):
-                creator = session.get(User, assignment.created_by)
-                if creator:
-                    result['created_by_name'] = creator.full_name
-            
-            if assignment.updated_by and ('updated_by_name' not in result or not result['updated_by_name']):
-                updater = session.get(User, assignment.updated_by)
-                if updater:
-                    result['updated_by_name'] = updater.full_name
-            
-            return jsonify(result)
+            return jsonify({
+                'id': assignment.notification_id,
+                'priority': assignment.priority,
+                'message': assignment.message,
+                'assigned_employee_id': assignment.employee_id,
+                'client_id': assignment.client_id,
+                'status': 'completed' if assignment.read else 'scheduled'
+            })
         
-        # ✅ PUT - FIXED: Enhanced date handling for drag & drop
+        # PUT - Update assignment
         elif request.method == 'PUT':
             data = request.json
-            current_app.logger.info(f"📝 RAW update data received: {data}")
+            current_app.logger.info(f"📝 Updating assignment {notification_id}: {data}")
             
-            # ✅ CRITICAL: Filter out invalid fields
             data = filter_assignment_data(data)
-            current_app.logger.info(f"📝 Updating assignment {assignment_id} with filtered data: {data}")
             
-            if 'type' in data:
-                assignment.type = data['type']
-            if 'title' in data:
-                assignment.title = data['title']
+            # Build updated message
+            updates = {}
             
-            # ✅ CRITICAL: Handle date updates for drag and drop
-            # Priority order: start_date > date field
-            if 'start_date' in data and data['start_date']:
-                assignment.start_date = datetime.strptime(data['start_date'], '%Y-%m-%d').date()
-                assignment.date = assignment.start_date  # Keep date in sync
-                current_app.logger.info(f"📅 Updated start_date to: {assignment.start_date}")
-            elif 'date' in data and data['date']:
-                assignment.date = datetime.strptime(data['date'], '%Y-%m-%d').date()
-                if not hasattr(assignment, 'start_date') or not assignment.start_date:
-                    assignment.start_date = assignment.date
-                current_app.logger.info(f"📅 Updated date to: {assignment.date}")
-            
-            if 'end_date' in data and data['end_date']:
-                assignment.end_date = datetime.strptime(data['end_date'], '%Y-%m-%d').date()
-                current_app.logger.info(f"📅 Updated end_date to: {assignment.end_date}")
-            elif 'start_date' in data and not ('end_date' in data):
-                # If only start_date provided, set end_date same as start_date
-                assignment.end_date = assignment.start_date
-                current_app.logger.info(f"📅 Set end_date same as start_date: {assignment.end_date}")
-            
-            if 'start_time' in data:
-                try:
-                    assignment.start_time = datetime.strptime(data['start_time'], '%H:%M').time() if data['start_time'] else None
-                except ValueError:
-                    current_app.logger.warning(f"Invalid start_time: {data['start_time']}")
-            if 'end_time' in data:
-                try:
-                    assignment.end_time = datetime.strptime(data['end_time'], '%H:%M').time() if data['end_time'] else None
-                except ValueError:
-                    current_app.logger.warning(f"Invalid end_time: {data['end_time']}")
-            if 'estimated_hours' in data:
-                estimated_hours = data['estimated_hours']
-                try:
-                    assignment.estimated_hours = float(estimated_hours) if isinstance(estimated_hours, str) else estimated_hours
-                except (ValueError, TypeError):
-                    current_app.logger.warning(f"Invalid estimated_hours: {estimated_hours}")
-            if 'notes' in data:
-                assignment.notes = data['notes']
             if 'priority' in data:
-                assignment.priority = data['priority']
+                updates['priority'] = data['priority'].lower()
+            
             if 'status' in data:
-                assignment.status = data['status']
-            if 'job_type' in data:
-                assignment.job_type = data['job_type']
-            if 'job_id' in data:
-                assignment.job_id = data['job_id']
+                if data['status'] == 'completed':
+                    updates['read'] = True
+                    updates['read_at'] = datetime.utcnow()
+                else:
+                    updates['read'] = False
             
-            # ✅ Update customer
-            if 'customer_id' in data:
-                assignment.customer_id = data['customer_id']
-                if data['customer_id']:
-                    customer = session.query(Customer).filter_by(id=data['customer_id']).first()
-                    if customer:
-                        if hasattr(assignment, 'customer_name'):
-                            assignment.customer_name = customer.name
+            if 'assigned_employee_id' in data:
+                updates['employee_id'] = data['assigned_employee_id']
             
-            if 'customer_name' in data:
-                assignment.customer_name = data['customer_name']
+            if 'client_id' in data:
+                updates['client_id'] = data['client_id']
             
-            if 'user_id' in data:
-                assignment.user_id = data['user_id']
-                new_user = session.get(User, data['user_id'])
-                if new_user:
-                    assignment.team_member = new_user.full_name
-            if 'team_member' in data:
-                assignment.team_member = data['team_member']
+            # Rebuild message if title/notes changed
+            if 'title' in data or 'notes' in data:
+                assignment_type = data.get('type', 'task')
+                title = data.get('title', '')
+                notes = data.get('notes', '')
                 
-            assignment.updated_by = current_user.id
-            assignment.updated_at = datetime.utcnow()
+                new_message = f"{assignment_type.upper()}: {title}"
+                if notes:
+                    new_message += f" | Notes: {notes}"
+                updates['message'] = new_message
             
-            session.commit()
-            session.refresh(assignment)
-            
-            current_app.logger.info(f"✅ Assignment {assignment_id} updated successfully")
-            
-            result = assignment.to_dict()
-            
-            # Add updater name
-            updater = session.get(User, current_user.id)
-            if updater:
-                result['updated_by_name'] = updater.full_name
+            if updates:
+                # Build UPDATE query dynamically
+                set_clauses = []
+                params = {'notification_id': notification_id, 'tenant_id': tenant_id}
+                
+                for key, value in updates.items():
+                    set_clauses.append(f"{key} = :{key}")
+                    params[key] = value
+                
+                update_query = text(f"""
+                    UPDATE "StreemLyne_MT"."Notification_Master"
+                    SET {', '.join(set_clauses)}
+                    WHERE notification_id = :notification_id
+                    AND tenant_id = :tenant_id
+                """)
+                
+                session.execute(update_query, params)
+                session.commit()
+                
+                current_app.logger.info(f"✅ Assignment {notification_id} updated")
             
             return jsonify({
                 'message': 'Assignment updated successfully',
-                'assignment': result
+                'assignment': {'id': notification_id}
             })
-            
-        # ✅ DELETE - FIXED: Always return JSON
+        
+        # DELETE
         elif request.method == 'DELETE':
-            current_app.logger.info(f"🗑️ Deleting assignment {assignment_id}")
-            session.delete(assignment)
-            session.commit()
-            current_app.logger.info(f"✅ Assignment {assignment_id} deleted")
+            delete_query = text("""
+                UPDATE "StreemLyne_MT"."Notification_Master"
+                SET dismissed = true
+                WHERE notification_id = :notification_id
+                AND tenant_id = :tenant_id
+            """)
             
-            # ✅ CRITICAL: Always return JSON, never HTML
+            session.execute(delete_query, {
+                'notification_id': notification_id,
+                'tenant_id': tenant_id
+            })
+            session.commit()
+            
+            current_app.logger.info(f"✅ Assignment {notification_id} deleted")
+            
             return jsonify({
                 'message': 'Assignment deleted successfully',
-                'id': assignment_id
+                'id': notification_id
             }), 200
         
-    except TypeError as e:
-        session.rollback()
-        current_app.logger.error(f"❌ TypeError (invalid field): {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': f'Invalid field in request: {str(e)}'}), 400
     except Exception as e:
         session.rollback()
         current_app.logger.error(f"Error in handle_single_assignment: {e}")
         import traceback
         traceback.print_exc()
-        # ✅ CRITICAL: Always return JSON, never HTML
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
 
 
-@assignment_bp.route('/assignments/by-date-range', methods=['GET'])
-@token_required 
-def get_assignments_by_date_range():
-    """Get assignments within a date range"""
-    current_user = request.current_user
-    start_date = request.args.get('start_date')
-    end_date = request.args.get('end_date')
-    
-    if not start_date or not end_date:
-        return jsonify({'error': 'start_date and end_date are required'}), 400
-    
-    session = SessionLocal()
-    try:
-        start = datetime.strptime(start_date, '%Y-%m-%d').date()
-        end = datetime.strptime(end_date, '%Y-%m-%d').date()
-        
-        current_app.logger.info(f"📅 Fetching assignments from {start} to {end}")
-        
-        # ✅ FIXED: Everyone sees all assignments in date range
-        assignments = session.query(Assignment).filter(
-            Assignment.date >= start,
-            Assignment.date <= end
-        ).order_by(Assignment.date).all()
-        
-        current_app.logger.info(f"✅ Found {len(assignments)} assignments in date range")
-        
-        result = []
-        for a in assignments:
-            try:
-                assignment_dict = a.to_dict()
-                
-                # Add user names
-                if a.created_by:
-                    creator = session.get(User, a.created_by)
-                    if creator:
-                        assignment_dict['created_by_name'] = creator.full_name
-                
-                if a.updated_by:
-                    updater = session.get(User, a.updated_by)
-                    if updater:
-                        assignment_dict['updated_by_name'] = updater.full_name
-                
-                result.append(assignment_dict)
-            except Exception as e:
-                current_app.logger.error(f"Error processing assignment {a.id}: {e}")
-                continue
-        
-        return jsonify(result)
-    except Exception as e:
-        current_app.logger.error(f"Error in get_assignments_by_date_range: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 400
-    finally:
-        session.close()
-
-
 @assignment_bp.route('/jobs/available', methods=['GET'])
-@token_required 
+@token_required
 def get_available_jobs():
-    """
-    Get jobs that are ready to be scheduled
+    """Get opportunities that are ready to be scheduled"""
     
-    Simple 3-stage system:
-    - Survey: Initial measurement/planning stage
-    - Delivery: Items ready for delivery
-    - Installation: Ready for installation
-    """
     session = SessionLocal()
     try:
-        current_app.logger.info("📋 Fetching available jobs for scheduling...")
+        tenant_id = get_current_tenant_id()
         
-        # ✅ All 3 work stages are schedulable
-        schedulable_work_stages = ['Survey', 'Delivery', 'Installation']
+        current_app.logger.info("📋 Fetching available jobs/opportunities...")
         
-        jobs = session.query(Job).filter(
-            Job.work_stage.in_(schedulable_work_stages)
-        ).order_by(Job.created_at.desc()).all()
+        # Query opportunities in schedulable stages
+        query = text("""
+            SELECT 
+                o.opportunity_id,
+                o.opportunity_title,
+                o.client_id,
+                o.process_stage,
+                o.service_id,
+                o.display_id,
+                c.client_company_name,
+                c.client_contact_name,
+                s.service_title
+            FROM "StreemLyne_MT"."Opportunity_Details" o
+            LEFT JOIN "StreemLyne_MT"."Client_Master" c ON o.client_id = c.client_id
+            LEFT JOIN "StreemLyne_MT"."Services_Master" s ON o.service_id = s.service_id
+            WHERE o.tenant_id = :tenant_id
+            AND o.deleted_at IS NULL
+            AND o.process_stage IN ('Not Started', 'In Progress', 'Survey', 'Delivery', 'Installation')
+            ORDER BY o.created_at DESC
+        """)
         
-        current_app.logger.info(f"✅ Found {len(jobs)} jobs in schedulable stages")
+        result = session.execute(query, {'tenant_id': tenant_id})
+        opportunities = result.fetchall()
         
-        result = []
-        for j in jobs:
-            try:
-                customer_name = 'Unknown'
-                customer_id = None
-                
-                # Handle both relationship and direct customer_id
-                if hasattr(j, 'customer') and j.customer:
-                    customer_name = j.customer.name
-                    customer_id = j.customer.id
-                elif j.customer_id:
-                    customer_id = j.customer_id
-                    # Try to fetch customer
-                    customer = session.get(Customer, j.customer_id)
-                    if customer:
-                        customer_name = customer.name
-                
-                result.append({
-                    'id': j.id,
-                    'job_reference': j.job_reference or f"JOB-{j.id}",
-                    'customer_name': customer_name,
-                    'customer_id': customer_id,
-                    'job_type': j.job_type or 'Interior Design',
-                    'stage': j.stage if hasattr(j, 'stage') else 'Unknown',
-                    'work_stage': j.work_stage if hasattr(j, 'work_stage') else 'Survey'
-                })
-            except Exception as job_error:
-                current_app.logger.error(f"Error processing job {j.id}: {job_error}")
-                import traceback
-                traceback.print_exc()
-                continue
+        current_app.logger.info(f"✅ Found {len(opportunities)} available jobs")
         
-        current_app.logger.info(f"✅ Returning {len(result)} jobs")
-        return jsonify(result)
+        jobs = []
+        for opp in opportunities:
+            jobs.append({
+                'id': opp.opportunity_id,
+                'job_reference': f"OPP-{opp.display_id}" if opp.display_id else f"OPP-{opp.opportunity_id}",
+                'customer_name': opp.client_company_name or opp.client_contact_name or 'Unknown',
+                'customer_id': opp.client_id,
+                'job_type': opp.service_title or 'Service',
+                'stage': opp.process_stage or 'Not Started',
+                'work_stage': opp.process_stage or 'Survey'
+            })
+        
+        return jsonify(jobs)
+        
     except Exception as e:
         current_app.logger.error(f"❌ Error in get_available_jobs: {e}")
         import traceback
         traceback.print_exc()
-        # ✅ Return empty array instead of error to allow graceful degradation
-        current_app.logger.info("⚠️ Returning empty jobs array due to error")
         return jsonify([]), 200
     finally:
         session.close()
 
 
 @assignment_bp.route('/customers/active', methods=['GET'])
-@token_required 
+@token_required
 def get_active_customers():
-    """Get active customers for assignments"""
+    """Get active clients for assignments"""
+    
     session = SessionLocal()
     try:
+        tenant_id = get_current_tenant_id()
+        
         current_app.logger.info("📋 Fetching active customers...")
         
-        # Get all customers
-        customers = session.query(Customer).order_by(Customer.name).all()
+        query = text("""
+            SELECT 
+                client_id,
+                client_company_name,
+                client_contact_name,
+                address,
+                client_phone,
+                stage,
+                is_deleted
+            FROM "StreemLyne_MT"."Client_Master"
+            WHERE tenant_id = :tenant_id
+            AND is_deleted = false
+            ORDER BY client_company_name, client_contact_name
+        """)
         
-        current_app.logger.info(f"✅ Found {len(customers)} customers")
+        result = session.execute(query, {'tenant_id': tenant_id})
+        clients = result.fetchall()
         
-        result = []
-        for c in customers:
-            try:
-                result.append({
-                    'id': c.id,
-                    'name': c.name,
-                    'address': c.address or '',
-                    'phone': c.phone or '',
-                    'stage': c.stage or 'Lead',
-                    'status': c.status if hasattr(c, 'status') else 'Active'
-                })
-            except Exception as customer_error:
-                current_app.logger.error(f"Error processing customer {c.id}: {customer_error}")
-                import traceback
-                traceback.print_exc()
-                continue
+        current_app.logger.info(f"✅ Found {len(clients)} customers")
         
-        current_app.logger.info(f"✅ Returning {len(result)} customers")
-        return jsonify(result)
+        customers = []
+        for c in clients:
+            customers.append({
+                'id': c.client_id,
+                'name': c.client_company_name or c.client_contact_name or 'Unknown',
+                'address': c.address or '',
+                'phone': c.client_phone or '',
+                'stage': c.stage or 'Lead',
+                'status': 'Deleted' if c.is_deleted else 'Active'
+            })
+        
+        return jsonify(customers)
+        
     except Exception as e:
         current_app.logger.error(f"❌ Error in get_active_customers: {e}")
         import traceback
         traceback.print_exc()
-        # ✅ Return empty array instead of error to allow graceful degradation
-        current_app.logger.info("⚠️ Returning empty customers array due to error")
         return jsonify([]), 200
     finally:
         session.close()
@@ -563,10 +578,17 @@ def get_active_customers():
 @assignment_bp.route('/jobs/work-stages', methods=['GET'])
 @token_required
 def get_job_work_stages():
-    """
-    Get all 3 job work stages with metadata
-    """
+    """Get all job work stages with metadata"""
+    
     work_stages = [
+        {
+            'value': 'Not Started',
+            'label': 'Not Started',
+            'description': 'Opportunity created, not yet started',
+            'color': '#6B7280',
+            'icon': '📋',
+            'order': 0
+        },
         {
             'value': 'Survey',
             'label': 'Survey',
@@ -576,12 +598,20 @@ def get_job_work_stages():
             'order': 1
         },
         {
+            'value': 'In Progress',
+            'label': 'In Progress',
+            'description': 'Work in progress',
+            'color': '#F59E0B',
+            'icon': '⚙️',
+            'order': 2
+        },
+        {
             'value': 'Delivery',
             'label': 'Delivery',
             'description': 'Items being delivered',
             'color': '#06B6D4',
             'icon': '🚚',
-            'order': 2
+            'order': 3
         },
         {
             'value': 'Installation',
@@ -589,7 +619,7 @@ def get_job_work_stages():
             'description': 'On-site installation',
             'color': '#14B8A6',
             'icon': '🏗️',
-            'order': 3
+            'order': 4
         }
     ]
     

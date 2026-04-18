@@ -1,15 +1,15 @@
-from flask import Blueprint, request, jsonify
-from ..models import Customer, Project, CustomerFormData, User, Job, DrawingDocument, FormDocument, ProductionNotification
-from functools import wraps
-from flask import current_app
-import uuid
+"""
+Customer Routes - Adapted for StreemLyne_MT schema
+Handles customer/client management and related operations
+"""
+from flask import Blueprint, request, jsonify, current_app
+from sqlalchemy import text, func
 from datetime import datetime
+import uuid
 import json
 
-# 👈 NEW IMPORT: Required for all database write operations
-from ..db import SessionLocal 
-from .notification_routes import create_activity_notification  # ✅ ADD THIS IMPORT
-
+from ..db import SessionLocal
+from .auth_helpers import token_required, get_current_tenant_id, get_current_employee_id
 
 customer_bp = Blueprint('customers', __name__)
 
@@ -22,7 +22,7 @@ STAGE_HIERARCHY = {
     "Measure": 4,
     "Design": 5,
     "Quoted": 6,
-    "Accepted": 7,  # ✅ MAKE SURE THIS EXISTS
+    "Accepted": 7,
     "Rejected": 8,
     "Ordered": 9,
     "Production": 10,
@@ -33,179 +33,103 @@ STAGE_HIERARCHY = {
     "Cancelled": 15
 }
 
+
 def get_most_advanced_stage(stages):
     """Given a list of stage strings, return the most advanced one"""
     if not stages:
         return "Lead"
     
-    # Filter out None values and get hierarchy values
     valid_stages = [s for s in stages if s and s in STAGE_HIERARCHY]
     if not valid_stages:
         return "Lead"
     
-    # Return the stage with highest hierarchy value
     return max(valid_stages, key=lambda s: STAGE_HIERARCHY.get(s, 0))
 
 
-# Token authentication decorator
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if request.method == 'OPTIONS':
-            return f(*args, **kwargs)
-        
-        token = None
-        
-        if 'Authorization' in request.headers:
-            auth_header = request.headers['Authorization']
-            try:
-                token = auth_header.split(" ")[1]
-            except IndexError:
-                return jsonify({'error': 'Invalid token format'}), 401
-        
-        if not token:
-            return jsonify({'error': 'Token is missing'}), 401
-        
-        try:
-            current_user = User.verify_jwt_token(token, current_app.config['SECRET_KEY'])
-            if not current_user:
-                return jsonify({'error': 'Token is invalid or expired'}), 401
-            
-            request.current_user = current_user
-            
-        except Exception as e:
-            return jsonify({'error': 'Token verification failed'}), 401
-        
-        return f(*args, **kwargs)
-    
-    return decorated
-
-
 # ==========================================
-# CUSTOMER ENDPOINTS
+# CLIENT/CUSTOMER ENDPOINTS
 # ==========================================
 
 @customer_bp.route('/customers', methods=['GET', 'OPTIONS'])
 @token_required
 def get_customers():
-    """Get all customers with their project counts, form counts, drawing counts, and MOST ADVANCED PROJECT STAGE."""
+    """Get all clients/customers with their opportunity counts and document counts"""
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        from sqlalchemy.orm import joinedload
-        from sqlalchemy import func
+        tenant_id = get_current_tenant_id()
         
-        # ✅ FIX 1: Load customers with projects in one query
-        customers = session.query(Customer).options(
-            joinedload(Customer.projects)
-        ).all()
+        # Get all clients for tenant
+        query = text("""
+            SELECT 
+                c.client_id,
+                c.client_company_name,
+                c.client_contact_name,
+                c.client_phone,
+                c.client_mobile,
+                c.client_email,
+                c.address,
+                c.post_code,
+                c.stage,
+                c.created_at,
+                c.assigned_employee_id,
+                c.is_deleted,
+                c.is_archived,
+                e.employee_name as salesperson_name,
+                COUNT(DISTINCT o.opportunity_id) as opportunity_count,
+                COUNT(DISTINCT cd.id) as document_count
+            FROM "StreemLyne_MT"."Client_Master" c
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" e ON c.assigned_employee_id = e.employee_id
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" o ON c.client_id = o.client_id AND o.deleted_at IS NULL
+            LEFT JOIN "StreemLyne_MT"."Customer_Documents" cd ON c.client_id = cd.client_id
+            WHERE c.tenant_id = :tenant_id
+            AND c.is_deleted = false
+            GROUP BY c.client_id, e.employee_name
+            ORDER BY c.created_at DESC
+        """)
         
-        current_app.logger.info(f"📊 Fetching data for {len(customers)} customers")
+        result = session.execute(query, {'tenant_id': tenant_id})
+        clients = result.fetchall()
         
-        # ✅ FIX 2: Get ALL counts in bulk queries (not one-by-one)
-        customer_ids = [c.id for c in customers]
+        current_app.logger.info(f"📊 Fetching data for {len(clients)} clients")
         
-        # Bulk count forms
-        form_counts = dict(
-            session.query(CustomerFormData.customer_id, func.count(CustomerFormData.id))
-            .filter(CustomerFormData.customer_id.in_(customer_ids))
-            .group_by(CustomerFormData.customer_id)
-            .all()
-        ) if customer_ids else {}
-        
-        # Bulk count drawings
-        drawing_counts = dict(
-            session.query(DrawingDocument.customer_id, func.count(DrawingDocument.id))
-            .filter(DrawingDocument.customer_id.in_(customer_ids))
-            .group_by(DrawingDocument.customer_id)
-            .all()
-        ) if customer_ids else {}
-        
-        # Bulk count form documents
-        form_doc_counts = dict(
-            session.query(FormDocument.customer_id, func.count(FormDocument.id))
-            .filter(FormDocument.customer_id.in_(customer_ids))
-            .group_by(FormDocument.customer_id)
-            .all()
-        ) if customer_ids else {}
-        
-        result = []
-        for customer in customers:
-            # ✅ Use pre-loaded projects
-            customer_projects = customer.projects
-            total_project_count = len(customer_projects)
-            
-            # ✅ Use bulk-loaded counts (default to 0 if customer not in dict)
-            form_count = form_counts.get(customer.id, 0)
-            drawing_count = drawing_counts.get(customer.id, 0)
-            form_doc_count = form_doc_counts.get(customer.id, 0)
-            
-            # Collect stages ONLY from projects
-            all_stages = [customer.stage] if customer.stage else []
-            all_stages.extend([project.stage for project in customer_projects if project.stage])
-            
-            # Get the most advanced stage
-            display_stage = get_most_advanced_stage(all_stages)
-            
-            # Ensure stage is always a string, never None
-            if not display_stage or display_stage == 'None':
-                display_stage = 'Lead'
-            
-            # Calculate total document count
-            total_documents = int(drawing_count) + int(form_count) + int(form_doc_count)
-            
+        customers = []
+        for client in clients:
             customer_data = {
-                'id': customer.id,
-                'name': customer.name,
-                'phone': customer.phone or '',
-                'email': customer.email or '',
-                'address': customer.address or '',
-                'postcode': customer.postcode or '',
-                'salesperson': customer.salesperson or '',
-                'contact_made': customer.contact_made or 'Unknown',
-                'preferred_contact_method': customer.preferred_contact_method or 'Phone',
-                'marketing_opt_in': bool(customer.marketing_opt_in),
-                'notes': customer.notes or '',
-                'status': customer.status or 'Active',
-                'date_of_measure': customer.date_of_measure.isoformat() if customer.date_of_measure else None,
-                'created_at': customer.created_at.isoformat() if customer.created_at else None,
-                'updated_at': customer.updated_at.isoformat() if customer.updated_at else None,
-                'created_by': customer.created_by,
-                'updated_by': customer.updated_by,
-                'stage': display_stage,
-                'project_count': total_project_count,
-                'form_count': int(form_count),
-                'drawing_count': int(drawing_count),
-                'form_document_count': int(form_doc_count),
-                'total_documents': total_documents,
-                'has_documents': total_documents > 0,
-                'has_drawings': drawing_count > 0,
-                'has_forms': form_count > 0 or form_doc_count > 0,
+                'id': client.client_id,
+                'name': client.client_company_name or client.client_contact_name or 'Unknown',
+                'phone': client.client_phone or client.client_mobile or '',
+                'email': client.client_email or '',
+                'address': client.address or '',
+                'postcode': client.post_code or '',
+                'salesperson': client.salesperson_name or '',
+                'stage': client.stage or 'Lead',
+                'status': 'Archived' if client.is_archived else 'Active',
+                'created_at': client.created_at.isoformat() if client.created_at else None,
+                'project_count': client.opportunity_count or 0,
+                'total_documents': client.document_count or 0,
+                'has_documents': (client.document_count or 0) > 0,
+                # Legacy fields for compatibility
+                'contact_made': 'Unknown',
+                'preferred_contact_method': 'Phone',
+                'marketing_opt_in': False,
+                'notes': '',
+                'form_count': 0,
+                'drawing_count': 0,
+                'form_document_count': 0,
+                'has_drawings': False,
+                'has_forms': False,
+                'project_types': []
             }
-            
-            # Handle project_types
-            project_types_value = customer.project_types
-            if project_types_value is None:
-                project_types_value = []
-            elif isinstance(project_types_value, str):
-                import json
-                try:
-                    project_types_value = json.loads(project_types_value)
-                except:
-                    project_types_value = []
-            elif not isinstance(project_types_value, list):
-                project_types_value = []
-            
-            customer_data['project_types'] = project_types_value
-            result.append(customer_data)
-
-        current_app.logger.info(f"✅ Returning {len(result)} customers")
+            customers.append(customer_data)
         
-        return jsonify(result), 200
-
+        current_app.logger.info(f"✅ Returning {len(customers)} customers")
+        
+        return jsonify(customers), 200
+        
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching customers: {e}")
         return jsonify({'error': 'Failed to fetch customers'}), 500
@@ -216,12 +140,15 @@ def get_customers():
 @customer_bp.route('/customers', methods=['POST', 'OPTIONS'])
 @token_required
 def create_customer():
-    """Create a new customer"""
+    """Create a new client/customer"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
+        tenant_id = get_current_tenant_id()
+        employee_id = get_current_employee_id()
+        
         data = request.get_json()
         
         current_app.logger.info(f"📝 Creating new customer with data: {data}")
@@ -231,70 +158,81 @@ def create_customer():
             return jsonify({'error': 'Name is required'}), 400
         if not data.get('phone'):
             return jsonify({'error': 'Phone is required'}), 400
-        if not data.get('address'):
-            return jsonify({'error': 'Address is required'}), 400
         
-        # ✅ CRITICAL FIX: Set default stage to 'Lead'
-        customer_id = str(uuid.uuid4())
+        # Determine if it's a company or individual
+        is_company = bool(data.get('client_company_name'))
         
-        # Create new customer
-        new_customer = Customer(
-            id=customer_id,
-            name=data.get('name'),
-            phone=data.get('phone'),
-            email=data.get('email', ''),
-            address=data.get('address'),
-            postcode=data.get('postcode', ''),
-            salesperson=data.get('salesperson', ''),
-            marketing_opt_in=data.get('marketing_opt_in', False),
-            notes=data.get('notes', ''),
-            contact_made='No',
-            preferred_contact_method='Phone',
-            stage='Lead',  # ✅ CRITICAL: Set default stage
-            status='Active',  # ✅ CRITICAL: Set default status
-            created_at=datetime.utcnow(),
-            created_by=str(request.current_user.id),
-            updated_at=datetime.utcnow(),
-            updated_by=str(request.current_user.id)
-        )
+        # Insert new client
+        insert_query = text("""
+            INSERT INTO "StreemLyne_MT"."Client_Master" (
+                tenant_id,
+                client_company_name,
+                client_contact_name,
+                client_phone,
+                client_mobile,
+                client_email,
+                address,
+                post_code,
+                stage,
+                assigned_employee_id,
+                created_at,
+                is_deleted,
+                is_archived
+            ) VALUES (
+                :tenant_id,
+                :company_name,
+                :contact_name,
+                :phone,
+                :mobile,
+                :email,
+                :address,
+                :postcode,
+                :stage,
+                :assigned_employee_id,
+                :created_at,
+                false,
+                false
+            )
+            RETURNING client_id
+        """)
         
-        session.add(new_customer)
+        name = data.get('name', '')
+        
+        result = session.execute(insert_query, {
+            'tenant_id': tenant_id,
+            'company_name': name if is_company else None,
+            'contact_name': name if not is_company else data.get('contact_name'),
+            'phone': data.get('phone'),
+            'mobile': data.get('mobile'),
+            'email': data.get('email', ''),
+            'address': data.get('address', ''),
+            'postcode': data.get('postcode', ''),
+            'stage': 'Lead',
+            'assigned_employee_id': employee_id,
+            'created_at': datetime.utcnow()
+        })
+        
+        client_id = result.fetchone()[0]
         session.commit()
-        session.refresh(new_customer)  # ✅ Refresh to get all fields
         
-        current_app.logger.info(f"✅ Customer {new_customer.id} created successfully by user {request.current_user.id}")
+        current_app.logger.info(f"✅ Client {client_id} created successfully")
         
-        # Return customer data in the same format as get_customers
         return jsonify({
             'success': True,
             'message': 'Customer created successfully',
             'customer': {
-                'id': new_customer.id,
-                'name': new_customer.name,
-                'phone': new_customer.phone,
-                'email': new_customer.email or '',
-                'address': new_customer.address,
-                'postcode': new_customer.postcode or '',
-                'salesperson': new_customer.salesperson or '',
-                'contact_made': new_customer.contact_made,
-                'preferred_contact_method': new_customer.preferred_contact_method,
-                'marketing_opt_in': new_customer.marketing_opt_in,
-                'notes': new_customer.notes or '',
-                'status': new_customer.status,
-                'stage': new_customer.stage,
-                'created_at': new_customer.created_at.isoformat(),
-                'updated_at': new_customer.updated_at.isoformat(),
-                'created_by': new_customer.created_by,
-                'updated_by': new_customer.updated_by,
+                'id': client_id,
+                'name': name,
+                'phone': data.get('phone'),
+                'email': data.get('email', ''),
+                'address': data.get('address', ''),
+                'postcode': data.get('postcode', ''),
+                'stage': 'Lead',
+                'status': 'Active',
+                'created_at': datetime.utcnow().isoformat(),
                 'project_count': 0,
-                'form_count': 0,
-                'drawing_count': 0,
-                'form_document_count': 0,
                 'total_documents': 0,
-                'has_documents': False,
-                'has_drawings': False,
-                'has_forms': False,
-                'project_types': []
+                'has_documents': False
             }
         }), 201
         
@@ -306,29 +244,89 @@ def create_customer():
         session.close()
 
 
-@customer_bp.route('/customers/<string:customer_id>', methods=['GET', 'OPTIONS'])
+@customer_bp.route('/customers/<int:customer_id>', methods=['GET', 'OPTIONS'])
 @token_required
 def get_customer(customer_id):
-    """Get a single customer by ID with all their projects AND form submissions"""
+    """Get a single customer by ID with all their opportunities"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        customer = session.get(Customer, customer_id)
+        tenant_id = get_current_tenant_id()
+        
+        # Get customer info
+        customer_query = text("""
+            SELECT 
+                c.client_id,
+                c.client_company_name,
+                c.client_contact_name,
+                c.client_phone,
+                c.client_mobile,
+                c.client_email,
+                c.address,
+                c.post_code,
+                c.stage,
+                c.created_at,
+                c.assigned_employee_id,
+                c.is_archived,
+                e.employee_name as salesperson_name
+            FROM "StreemLyne_MT"."Client_Master" c
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" e ON c.assigned_employee_id = e.employee_id
+            WHERE c.client_id = :client_id AND c.tenant_id = :tenant_id AND c.is_deleted = false
+        """)
+        
+        result = session.execute(customer_query, {
+            'client_id': customer_id,
+            'tenant_id': tenant_id
+        })
+        customer = result.fetchone()
+        
         if not customer:
             return jsonify({'error': 'Customer not found'}), 404
         
-        # Check access permissions
-        if request.current_user.role == 'Sales':
-            if customer.created_by != str(request.current_user.id) and customer.salesperson != request.current_user.full_name:
-                return jsonify({'error': 'You do not have permission to view this customer'}), 403
-        elif request.current_user.role == 'Staff':
-            if customer.created_by != str(request.current_user.id) and customer.salesperson != request.current_user.full_name:
-                return jsonify({'error': 'You do not have permission to view this customer'}), 403
+        # Get opportunities for this customer
+        opp_query = text("""
+            SELECT 
+                opportunity_id,
+                opportunity_title,
+                process_stage as stage,
+                service_id,
+                created_at
+            FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE client_id = :client_id AND tenant_id = :tenant_id AND deleted_at IS NULL
+            ORDER BY created_at DESC
+        """)
         
-        # ✅ Return customer with BOTH projects AND forms
-        return jsonify(customer.to_dict(include_projects=True, include_forms=True)), 200
+        opp_result = session.execute(opp_query, {
+            'client_id': customer_id,
+            'tenant_id': tenant_id
+        })
+        opportunities = opp_result.fetchall()
+        
+        projects = [{
+            'id': opp.opportunity_id,
+            'project_name': opp.opportunity_title,
+            'stage': opp.stage or 'Not Started',
+            'created_at': opp.created_at.isoformat() if opp.created_at else None
+        } for opp in opportunities]
+        
+        customer_data = {
+            'id': customer.client_id,
+            'name': customer.client_company_name or customer.client_contact_name,
+            'phone': customer.client_phone or customer.client_mobile or '',
+            'email': customer.client_email or '',
+            'address': customer.address or '',
+            'postcode': customer.post_code or '',
+            'salesperson': customer.salesperson_name or '',
+            'stage': customer.stage or 'Lead',
+            'status': 'Archived' if customer.is_archived else 'Active',
+            'created_at': customer.created_at.isoformat() if customer.created_at else None,
+            'projects': projects,
+            'project_count': len(projects)
+        }
+        
+        return jsonify(customer_data), 200
         
     except Exception as e:
         current_app.logger.exception(f"Error fetching customer {customer_id}: {e}")
@@ -337,7 +335,7 @@ def get_customer(customer_id):
         session.close()
 
 
-@customer_bp.route('/customers/<string:customer_id>', methods=['PUT', 'OPTIONS'])
+@customer_bp.route('/customers/<int:customer_id>', methods=['PUT', 'OPTIONS'])
 @token_required
 def update_customer(customer_id):
     """Update a customer"""
@@ -346,50 +344,54 @@ def update_customer(customer_id):
     
     session = SessionLocal()
     try:
-        customer = session.get(Customer, customer_id)
-        if not customer:
-            return jsonify({'error': 'Customer not found'}), 404
-        
-        # Check permissions
-        if request.current_user.role == 'Sales':
-            if customer.created_by != str(request.current_user.id) and customer.salesperson != request.current_user.full_name:
-                return jsonify({'error': 'You do not have permission to edit this customer'}), 403
-        
+        tenant_id = get_current_tenant_id()
         data = request.get_json()
         
-        # Update customer fields
+        # Build dynamic UPDATE query
+        update_fields = []
+        params = {'client_id': customer_id, 'tenant_id': tenant_id}
+        
         if 'name' in data:
-            customer.name = data['name']
+            # Update both company and contact name fields
+            update_fields.append('client_company_name = :name')
+            update_fields.append('client_contact_name = :name')
+            params['name'] = data['name']
+        
         if 'phone' in data:
-            customer.phone = data['phone']
+            update_fields.append('client_phone = :phone')
+            params['phone'] = data['phone']
+        
         if 'email' in data:
-            customer.email = data['email']
+            update_fields.append('client_email = :email')
+            params['email'] = data['email']
+        
         if 'address' in data:
-            customer.address = data['address']
+            update_fields.append('address = :address')
+            params['address'] = data['address']
+        
         if 'postcode' in data:
-            customer.postcode = data['postcode']
-        if 'contact_made' in data:
-            customer.contact_made = data['contact_made']
-        if 'preferred_contact_method' in data:
-            customer.preferred_contact_method = data['preferred_contact_method']
-        if 'marketing_opt_in' in data:
-            customer.marketing_opt_in = data['marketing_opt_in']
-        if 'notes' in data:
-            customer.notes = data['notes']
-        if 'salesperson' in data:
-            customer.salesperson = data['salesperson']
+            update_fields.append('post_code = :postcode')
+            params['postcode'] = data['postcode']
         
-        customer.updated_by = str(request.current_user.id)
-        customer.updated_at = datetime.utcnow()
+        if 'stage' in data:
+            update_fields.append('stage = :stage')
+            params['stage'] = data['stage']
         
+        if not update_fields:
+            return jsonify({'error': 'No fields to update'}), 400
+        
+        update_query = text(f"""
+            UPDATE "StreemLyne_MT"."Client_Master"
+            SET {', '.join(update_fields)}
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """)
+        
+        session.execute(update_query, params)
         session.commit()
-        
-        customer_dict = customer.to_dict(include_projects=True)
         
         return jsonify({
             'success': True,
-            'message': 'Customer updated successfully',
-            'customer': customer_dict
+            'message': 'Customer updated successfully'
         }), 200
         
     except Exception as e:
@@ -399,103 +401,94 @@ def update_customer(customer_id):
     finally:
         session.close()
 
-@customer_bp.route('/customers/<string:customer_id>/stage', methods=['PATCH', 'OPTIONS'])
+
+@customer_bp.route('/customers/<int:customer_id>/stage', methods=['PATCH', 'OPTIONS'])
 @token_required
 def update_customer_stage_direct(customer_id):
-    """Update customer stage directly - WITH NOTIFICATIONS AND ACTION ITEMS"""
+    """Update customer stage directly"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        customer = session.get(Customer, customer_id)
-        if not customer:
-            return jsonify({'error': 'Customer not found'}), 404
-
+        tenant_id = get_current_tenant_id()
+        employee_id = get_current_employee_id()
+        
         data = request.get_json()
         new_stage = data.get('stage')
         
         if not new_stage:
             return jsonify({'error': 'Stage is required'}), 400
-
-        current_app.logger.info(f"🔄 Updating customer {customer_id} stage to {new_stage}")
         
-        old_stage = customer.stage
-        customer.stage = new_stage
-        customer.updated_by = str(request.current_user.id)
-        customer.updated_at = datetime.utcnow()
+        # Get old stage
+        old_stage_query = text("""
+            SELECT stage FROM "StreemLyne_MT"."Client_Master"
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """)
+        result = session.execute(old_stage_query, {
+            'client_id': customer_id,
+            'tenant_id': tenant_id
+        })
+        old_stage_row = result.fetchone()
         
-        # ✅ CRITICAL: Commit customer update FIRST
-        session.commit()
-        session.refresh(customer)
+        if not old_stage_row:
+            return jsonify({'error': 'Customer not found'}), 404
         
-        current_app.logger.info(f"✅ Customer stage updated: {old_stage} → {new_stage}")
+        old_stage = old_stage_row.stage
         
-        # ✅ Create action item when moved to Accepted
+        # Update stage
+        update_query = text("""
+            UPDATE "StreemLyne_MT"."Client_Master"
+            SET stage = :stage
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """)
+        
+        session.execute(update_query, {
+            'stage': new_stage,
+            'client_id': customer_id,
+            'tenant_id': tenant_id
+        })
+        
+        # Create notification for important stages
         if new_stage == 'Accepted' and old_stage != 'Accepted':
-            try:
-                from ..models import ActionItem
-                import uuid
-                
-                # Check if action item already exists
-                existing = session.query(ActionItem).filter(
-                    ActionItem.customer_id == customer_id,
-                    ActionItem.stage == 'Accepted',
-                    ActionItem.completed == False
-                ).first()
-                
-                if not existing:
-                    action_item = ActionItem(
-                        id=str(uuid.uuid4()),
-                        customer_id=customer_id,
-                        stage='Accepted',
-                        priority='High',
-                        completed=False
-                    )
-                    session.add(action_item)
-                    session.commit()
-                    current_app.logger.info(f"✅ Created action item for customer {customer.name}")
-            except Exception as action_error:
-                current_app.logger.error(f"⚠️ Failed to create action item: {action_error}")
-                # Don't fail the request if action item creation fails
-        
-        # ✅ Create notification for important stages
-        important_stages = ['Accepted', 'Production', 'Delivery', 'Installation', 'Complete']
-        
-        if new_stage in important_stages and old_stage != new_stage:
-            try:
-                stage_emoji = {
-                    'Accepted': '✅',
-                    'Production': '🏭',
-                    'Delivery': '🚚',
-                    'Installation': '🔧',
-                    'Complete': '🎉'
-                }
-                emoji = stage_emoji.get(new_stage, '🔄')
-                
-                user_name = request.current_user.full_name if hasattr(request.current_user, 'full_name') else request.current_user.email
-                
-                notification_message = f"{emoji} Customer '{customer.name}' moved to {new_stage} stage"
-                
-                # Use the helper function to create notification
-                create_activity_notification(
-                    session=session,
-                    message=notification_message,
-                    customer_id=customer_id,
-                    moved_by=user_name
+            notify_query = text("""
+                INSERT INTO "StreemLyne_MT"."Notification_Master" (
+                    tenant_id,
+                    employee_id,
+                    client_id,
+                    notification_type,
+                    priority,
+                    message,
+                    read,
+                    dismissed
+                ) VALUES (
+                    :tenant_id,
+                    :employee_id,
+                    :client_id,
+                    'task',
+                    'high',
+                    :message,
+                    false,
+                    false
                 )
-                
-                current_app.logger.info(f"✅ Created {new_stage} stage notification for customer {customer.name}")
-                
-            except Exception as notif_error:
-                current_app.logger.error(f"⚠️ Failed to create notification: {notif_error}")
-                # Don't fail the request if notification fails
+            """)
+            
+            session.execute(notify_query, {
+                'tenant_id': tenant_id,
+                'employee_id': employee_id,
+                'client_id': customer_id,
+                'message': f'✅ Client moved to Accepted stage - Action required'
+            })
+        
+        session.commit()
+        
+        current_app.logger.info(f"✅ Customer {customer_id} stage updated: {old_stage} → {new_stage}")
         
         return jsonify({
             'success': True,
-            'customer_id': customer.id,
+            'customer_id': customer_id,
             'old_stage': old_stage,
-            'new_stage': customer.stage,
+            'new_stage': new_stage
         }), 200
         
     except Exception as e:
@@ -505,67 +498,33 @@ def update_customer_stage_direct(customer_id):
     finally:
         session.close()
 
-@customer_bp.route('/forms/<string:form_id>', methods=['DELETE', 'OPTIONS'])
-@token_required
-def delete_form_submission(form_id):
-    """Delete a form submission (Manager/HR only)"""
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-    
-    session = SessionLocal()
-    try:
-        # Only Manager and HR can delete
-        if request.current_user.role not in ['Manager', 'HR']:
-            return jsonify({'error': 'You do not have permission to delete form submissions'}), 403
-        
-        form = session.get(CustomerFormData, form_id)
-        if not form:
-            return jsonify({'error': 'Form submission not found'}), 404
-        
-        session.delete(form)
-        session.commit()
-        
-        current_app.logger.info(f"Form submission {form_id} deleted by user {request.current_user.id}")
-        
-        return jsonify({
-            'success': True,
-            'message': 'Form submission deleted successfully'
-        }), 200
-        
-    except Exception as e:
-        session.rollback()
-        current_app.logger.exception(f"Error deleting form submission {form_id}: {e}")
-        return jsonify({'error': 'Failed to delete form submission'}), 500
-    finally:
-        session.close()
 
-@customer_bp.route('/customers/<string:customer_id>', methods=['DELETE', 'OPTIONS'])
+@customer_bp.route('/customers/<int:customer_id>', methods=['DELETE', 'OPTIONS'])
 @token_required
 def delete_customer(customer_id):
-    """Delete a customer (Manager/HR only)"""
+    """Soft delete a customer"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        # Only Manager and HR can delete
-        if request.current_user.role not in ['Manager', 'HR']:
-            return jsonify({'error': 'You do not have permission to delete customers'}), 403
+        tenant_id = get_current_tenant_id()
         
-        customer = session.get(Customer, customer_id)
-        if not customer:
-            return jsonify({'error': 'Customer not found'}), 404
+        # Soft delete
+        delete_query = text("""
+            UPDATE "StreemLyne_MT"."Client_Master"
+            SET is_deleted = true, deleted_at = :deleted_at
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """)
         
-        # Check if customer has projects - warn if they do
-        if customer.projects:
-            return jsonify({
-                'error': f'Cannot delete customer with {len(customer.projects)} project(s). Delete projects first.'
-            }), 400
-        
-        session.delete(customer)
+        session.execute(delete_query, {
+            'deleted_at': datetime.utcnow(),
+            'client_id': customer_id,
+            'tenant_id': tenant_id
+        })
         session.commit()
         
-        current_app.logger.info(f"Customer {customer_id} deleted by user {request.current_user.id}")
+        current_app.logger.info(f"Customer {customer_id} soft deleted")
         
         return jsonify({
             'success': True,
@@ -581,48 +540,49 @@ def delete_customer(customer_id):
 
 
 # ==========================================
-# PROJECT ENDPOINTS
+# OPPORTUNITY/PROJECT ENDPOINTS
 # ==========================================
 
-@customer_bp.route('/customers/<string:customer_id>/projects', methods=['GET', 'OPTIONS'])
+@customer_bp.route('/customers/<int:customer_id>/projects', methods=['GET', 'OPTIONS'])
 @token_required
 def get_customer_projects(customer_id):
-    """Get all projects for a specific customer with full details."""
+    """Get all opportunities for a specific customer"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        customer = session.get(Customer, customer_id)
-        if not customer:
-            return jsonify({'error': 'Customer not found'}), 404
+        tenant_id = get_current_tenant_id()
         
-        # Get all projects for this customer
-        projects = session.query(Project).filter_by(customer_id=customer_id).all()
+        query = text("""
+            SELECT 
+                opportunity_id,
+                opportunity_title,
+                process_stage,
+                service_id,
+                created_at
+            FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE client_id = :client_id 
+            AND tenant_id = :tenant_id 
+            AND deleted_at IS NULL
+            ORDER BY created_at DESC
+        """)
         
-        projects_list = []
-        for project in projects:
-            project_data = {
-                'id': project.id,
-                'project_name': project.project_name,
-                'project_type': project.project_type,
-                'stage': project.stage,
-                'date_of_measure': project.date_of_measure.isoformat() if project.date_of_measure else None,
-                'notes': project.notes,
-                'created_at': project.created_at.isoformat() if project.created_at else None,
-                'updated_at': project.updated_at.isoformat() if project.updated_at else None
-            }
-            projects_list.append(project_data)
+        result = session.execute(query, {
+            'client_id': customer_id,
+            'tenant_id': tenant_id
+        })
+        opportunities = result.fetchall()
         
-        return jsonify({
-            'customer': {
-                'id': customer.id,
-                'name': customer.name,
-                'phone': customer.phone,
-                'email': customer.email
-            },
-            'projects': projects_list
-        }), 200
+        projects = [{
+            'id': opp.opportunity_id,
+            'project_name': opp.opportunity_title,
+            'stage': opp.process_stage or 'Not Started',
+            'service_id': opp.service_id,
+            'created_at': opp.created_at.isoformat() if opp.created_at else None
+        } for opp in opportunities]
+        
+        return jsonify({'projects': projects}), 200
         
     except Exception as e:
         current_app.logger.exception(f"Error fetching customer projects: {e}")
@@ -630,117 +590,68 @@ def get_customer_projects(customer_id):
     finally:
         session.close()
 
-@customer_bp.route('/customers/<string:customer_id>/projects', methods=['POST', 'OPTIONS'])
+
+@customer_bp.route('/customers/<int:customer_id>/projects', methods=['POST', 'OPTIONS'])
 @token_required
 def create_project(customer_id):
-    """Create a new project for a customer."""
+    """Create a new opportunity for a customer"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        customer = session.get(Customer, customer_id)
-        if not customer:
-            return jsonify({'error': 'Customer not found'}), 404
-        
-        # Check permissions
-        allowed_roles = ['Manager', 'HR', 'Sales']
-        
-        if request.current_user.role not in allowed_roles:
-            return jsonify({
-                'error': f'You do not have permission to create projects. Only {", ".join(allowed_roles)} can create projects.'
-            }), 403
+        tenant_id = get_current_tenant_id()
+        employee_id = get_current_employee_id()
         
         data = request.get_json()
         
-        # Validate required fields
         if not data.get('project_name'):
             return jsonify({'error': 'Project name is required'}), 400
-        if not data.get('project_type'):
-            return jsonify({'error': 'Project type is required'}), 400
         
-        # Create new project
-        new_project = Project(
-            id=str(uuid.uuid4()),
-            customer_id=customer_id,
-            project_name=data.get('project_name'),
-            project_type=data.get('project_type'),
-            stage=data.get('stage', 'Lead'),
-            date_of_measure=datetime.fromisoformat(data['date_of_measure']) if data.get('date_of_measure') else None,
-            notes=data.get('notes', ''),
-            created_at=datetime.utcnow(),
-            created_by=str(request.current_user.id)
-        )
-        
-        session.add(new_project)
-        session.flush()  # Get the project ID
-        
-        # ✅ Get user name
-        user_name = request.current_user.full_name if hasattr(request.current_user, 'full_name') else request.current_user.email
-        
-        # ✅ CRITICAL FIX: Use the imported helper function
-        try:
-            notification_message = f"➕ New {data.get('project_type', 'project')} project created for customer '{customer.name}' - {data.get('project_name')}"
-            
-            create_activity_notification(
-                session=session,
-                message=notification_message,
-                customer_id=customer_id,
-                moved_by=user_name
+        # Insert new opportunity
+        insert_query = text("""
+            INSERT INTO "StreemLyne_MT"."Opportunity_Details" (
+                tenant_id,
+                client_id,
+                opportunity_title,
+                process_stage,
+                opportunity_owner_employee_id,
+                stage_id,
+                created_at
+            ) VALUES (
+                :tenant_id,
+                :client_id,
+                :title,
+                :process_stage,
+                :employee_id,
+                1,
+                :created_at
             )
-            
-            current_app.logger.info(f"✅ Created project creation notification")
-            
-        except Exception as notif_error:
-            current_app.logger.warning(f"⚠️ Failed to create notification: {notif_error}")
+            RETURNING opportunity_id
+        """)
         
-        # Update customer stage if this is the first project
-        old_customer_stage = customer.stage
-        new_stage = new_project.stage
+        result = session.execute(insert_query, {
+            'tenant_id': tenant_id,
+            'client_id': customer_id,
+            'title': data['project_name'],
+            'process_stage': data.get('stage', 'Not Started'),
+            'employee_id': employee_id,
+            'created_at': datetime.utcnow()
+        })
         
-        existing_project_count = session.query(Project).filter_by(customer_id=customer_id).count()
-        existing_job_count = session.query(Job).filter_by(customer_id=customer_id).count()
-        
-        if existing_project_count == 1 and existing_job_count == 0 and new_stage:
-            customer.stage = new_stage
-            customer.updated_at = datetime.utcnow()
-            
-            # ✅ CRITICAL FIX: Create notification for stage changes using helper function
-            important_stages = ['Accepted', 'Production', 'Delivery', 'Installation', 'Complete']
-            
-            if new_stage in important_stages and old_customer_stage != new_stage:
-                try:
-                    stage_emoji = {
-                        'Accepted': '✅',
-                        'Production': '🏭',
-                        'Delivery': '🚚',
-                        'Installation': '🔧',
-                        'Complete': '🎉'
-                    }
-                    emoji = stage_emoji.get(new_stage, '🔄')
-                    
-                    stage_message = f"{emoji} Customer '{customer.name}' moved from {old_customer_stage} to {new_stage} stage"
-                    
-                    create_activity_notification(
-                        session=session,
-                        message=stage_message,
-                        customer_id=customer_id,
-                        moved_by=user_name
-                    )
-                    
-                    current_app.logger.info(f"✅ Created {new_stage} stage notification")
-                    
-                except Exception as stage_notif_error:
-                    current_app.logger.warning(f"⚠️ Failed to create stage notification: {stage_notif_error}")
-        
+        opportunity_id = result.fetchone()[0]
         session.commit()
         
-        current_app.logger.info(f"✅ Project {new_project.id} created for customer {customer_id}")
+        current_app.logger.info(f"✅ Opportunity {opportunity_id} created for customer {customer_id}")
         
         return jsonify({
             'success': True,
             'message': 'Project created successfully',
-            'project': new_project.to_dict()
+            'project': {
+                'id': opportunity_id,
+                'project_name': data['project_name'],
+                'stage': data.get('stage', 'Not Started')
+            }
         }), 201
         
     except Exception as e:
@@ -751,27 +662,52 @@ def create_project(customer_id):
         session.close()
 
 
-@customer_bp.route('/projects/<string:project_id>', methods=['GET', 'OPTIONS'])
+@customer_bp.route('/projects/<int:project_id>', methods=['GET', 'OPTIONS'])
 @token_required
 def get_project(project_id):
-    """Get a specific project with all its details"""
+    """Get a specific opportunity/project"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        project = session.get(Project, project_id)
-        if not project:
+        tenant_id = get_current_tenant_id()
+        
+        query = text("""
+            SELECT 
+                o.opportunity_id,
+                o.opportunity_title,
+                o.process_stage,
+                o.created_at,
+                c.client_id,
+                c.client_company_name,
+                c.client_contact_name
+            FROM "StreemLyne_MT"."Opportunity_Details" o
+            JOIN "StreemLyne_MT"."Client_Master" c ON o.client_id = c.client_id
+            WHERE o.opportunity_id = :opportunity_id 
+            AND o.tenant_id = :tenant_id
+            AND o.deleted_at IS NULL
+        """)
+        
+        result = session.execute(query, {
+            'opportunity_id': project_id,
+            'tenant_id': tenant_id
+        })
+        opp = result.fetchone()
+        
+        if not opp:
             return jsonify({'error': 'Project not found'}), 404
-            
-        customer = project.customer
         
-        # Check permissions
-        if request.current_user.role in ['Sales', 'Staff']:
-            if customer.created_by != str(request.current_user.id) and customer.salesperson != request.current_user.full_name:
-                return jsonify({'error': 'You do not have permission to view this project'}), 403
-        
-        return jsonify(project.to_dict(include_forms=True)), 200
+        return jsonify({
+            'id': opp.opportunity_id,
+            'project_name': opp.opportunity_title,
+            'stage': opp.process_stage or 'Not Started',
+            'created_at': opp.created_at.isoformat() if opp.created_at else None,
+            'customer': {
+                'id': opp.client_id,
+                'name': opp.client_company_name or opp.client_contact_name
+            }
+        }), 200
         
     except Exception as e:
         current_app.logger.exception(f"Error fetching project {project_id}: {e}")
@@ -780,105 +716,46 @@ def get_project(project_id):
         session.close()
 
 
-@customer_bp.route('/projects/<string:project_id>', methods=['PUT', 'OPTIONS'])
+@customer_bp.route('/projects/<int:project_id>', methods=['PUT', 'OPTIONS'])
 @token_required
 def update_project(project_id):
-    """Update a project."""
+    """Update an opportunity/project"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        project = session.get(Project, project_id)
-        if not project:
-            return jsonify({'error': 'Project not found'}), 404
-            
-        customer = project.customer
-        
-        # Check permissions
-        if request.current_user.role in ['Sales', 'Staff']:
-            if customer.created_by != str(request.current_user.id) and customer.salesperson != request.current_user.full_name:
-                return jsonify({'error': 'You do not have permission to edit this project'}), 403
-        
+        tenant_id = get_current_tenant_id()
         data = request.get_json()
         
-        old_stage = project.stage
+        update_fields = []
+        params = {'opportunity_id': project_id, 'tenant_id': tenant_id}
         
-        # Update fields
         if 'project_name' in data:
-            project.project_name = data['project_name']
-        if 'project_type' in data:
-            project.project_type = data['project_type']
+            update_fields.append('opportunity_title = :title')
+            params['title'] = data['project_name']
+        
         if 'stage' in data:
-            project.stage = data['stage']
-        if 'date_of_measure' in data:
-            project.date_of_measure = datetime.fromisoformat(data['date_of_measure']) if data['date_of_measure'] else None
-        if 'notes' in data:
-            project.notes = data['notes']
+            update_fields.append('process_stage = :stage')
+            params['stage'] = data['stage']
         
-        project.updated_by = str(request.current_user.id)
-        project.updated_at = datetime.utcnow()
+        if not update_fields:
+            return jsonify({'error': 'No fields to update'}), 400
         
-        # Count existing linked entities
-        total_other_linked_entities = session.query(Project).filter(Project.customer_id==customer.id, Project.id != project_id).count() + \
-                                      session.query(Job).filter_by(customer_id=customer.id).count()
+        update_query = text(f"""
+            UPDATE "StreemLyne_MT"."Opportunity_Details"
+            SET {', '.join(update_fields)}, process_stage_updated_at = :updated_at
+            WHERE opportunity_id = :opportunity_id AND tenant_id = :tenant_id
+        """)
         
-        if 'stage' in data and project.stage != old_stage and total_other_linked_entities == 0:
-            old_customer_stage = customer.stage
-            customer.stage = project.stage
-            
-            # ✅ CREATE ACTION ITEM when project moves to Accepted
-            if project.stage == 'Accepted' and old_stage != 'Accepted':
-                current_app.logger.info(f"🎯 Project moved to Accepted, creating action item for customer {customer.name}...")
-                try:
-                    from ..models import ActionItem
-                    
-                    # Check if action item already exists for this customer
-                    existing = session.query(ActionItem).filter(
-                        ActionItem.customer_id == customer.id,
-                        ActionItem.stage == 'Accepted',
-                        ActionItem.completed == False
-                    ).first()
-                    
-                    if existing:
-                        current_app.logger.info(f"⏭️ Action item already exists for customer {customer.name}")
-                    else:
-                        action_item = ActionItem(
-                            id=str(uuid.uuid4()),
-                            customer_id=customer.id,
-                            stage='Accepted',
-                            priority='High',
-                            completed=False
-                        )
-                        session.add(action_item)
-                        session.flush()  # Get the ID without committing
-                        current_app.logger.info(f"✅ Successfully created action item {action_item.id} for customer {customer.name}")
-                except Exception as action_error:
-                    current_app.logger.error(f"❌ Failed to create action item: {str(action_error)}")
-                    import traceback
-                    current_app.logger.error(traceback.format_exc())
-                    # Don't fail the request if action item creation fails
-            
-            # Existing Production notification code
-            if project.stage == 'Production' and old_customer_stage != 'Production':
-                notification = ProductionNotification(
-                    id=str(uuid.uuid4()),
-                    customer_id=customer.id,
-                    message=f"Customer '{customer.name}' moved to Production stage",
-                    created_at=datetime.utcnow(),
-                    moved_by=request.current_user.email,
-                    read=False
-                )
-                session.add(notification)
+        params['updated_at'] = datetime.utcnow()
         
+        session.execute(update_query, params)
         session.commit()
-        
-        current_app.logger.info(f"Project {project_id} updated")
         
         return jsonify({
             'success': True,
-            'message': 'Project updated successfully',
-            'project': project.to_dict(include_forms=True)
+            'message': 'Project updated successfully'
         }), 200
         
     except Exception as e:
@@ -889,38 +766,31 @@ def update_project(project_id):
         session.close()
 
 
-@customer_bp.route('/projects/<string:project_id>', methods=['DELETE', 'OPTIONS'])
+@customer_bp.route('/projects/<int:project_id>', methods=['DELETE', 'OPTIONS'])
 @token_required
 def delete_project(project_id):
-    """Delete a project (Manager/HR only)"""
+    """Soft delete a project/opportunity"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        if request.current_user.role not in ['Manager', 'HR']:
-            return jsonify({'error': 'You do not have permission to delete projects'}), 403
+        tenant_id = get_current_tenant_id()
         
-        project = session.get(Project, project_id)
-        if not project:
-            return jsonify({'error': 'Project not found'}), 404
+        delete_query = text("""
+            UPDATE "StreemLyne_MT"."Opportunity_Details"
+            SET deleted_at = :deleted_at
+            WHERE opportunity_id = :opportunity_id AND tenant_id = :tenant_id
+        """)
         
-        customer_id = project.customer_id
-        
-        session.delete(project)
+        session.execute(delete_query, {
+            'deleted_at': datetime.utcnow(),
+            'opportunity_id': project_id,
+            'tenant_id': tenant_id
+        })
         session.commit()
         
-        # Check if customer has remaining projects or jobs
-        remaining_projects_count = session.query(Project).filter_by(customer_id=customer_id).count()
-        remaining_jobs_count = session.query(Job).filter_by(customer_id=customer_id).count()
-        
-        if remaining_projects_count == 0 and remaining_jobs_count == 0:
-             customer = session.get(Customer, customer_id)
-             if customer:
-                 customer.stage = 'Lead' 
-                 session.commit()
-
-        current_app.logger.info(f"Project {project_id} deleted")
+        current_app.logger.info(f"Project {project_id} soft deleted")
         
         return jsonify({
             'success': True,
@@ -936,69 +806,46 @@ def delete_project(project_id):
 
 
 # ==========================================
-# PROJECT FORMS ENDPOINTS
-# ==========================================
-
-@customer_bp.route('/projects/<string:project_id>/forms', methods=['GET', 'OPTIONS'])
-@token_required
-def get_project_forms(project_id):
-    """Get all forms for a specific project"""
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-    
-    session = SessionLocal()
-    try:
-        project = session.get(Project, project_id)
-        if not project:
-            return jsonify({'error': 'Project not found'}), 404
-            
-        customer = project.customer
-        
-        # Check permissions
-        if request.current_user.role in ['Sales', 'Staff']:
-            if customer.created_by != str(request.current_user.id) and customer.salesperson != request.current_user.full_name:
-                return jsonify({'error': 'You do not have permission to view forms for this project'}), 403
-        
-        forms = session.query(CustomerFormData).filter_by(project_id=project_id).order_by(CustomerFormData.submitted_at.desc()).all()
-        
-        return jsonify([form.to_dict() for form in forms]), 200
-        
-    except Exception as e:
-        current_app.logger.exception(f"Error fetching forms: {e}")
-        return jsonify({'error': 'Failed to fetch forms'}), 500
-    finally:
-        session.close()
-
-    
-# ==========================================
-# DRAWING DOCUMENTS ENDPOINTS
+# DOCUMENTS ENDPOINTS
 # ==========================================
 
 @customer_bp.route('/drawings', methods=['GET', 'OPTIONS'])
 @token_required
 def get_drawing_documents():
-    """Get all drawing documents for a specific customer"""
+    """Get all documents for a specific customer"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
+        tenant_id = get_current_tenant_id()
         customer_id = request.args.get('customer_id')
+        
         if not customer_id:
             return jsonify({'error': 'Customer ID is required'}), 400
         
-        customer = session.get(Customer, customer_id)
-        if not customer:
-            return jsonify({'error': 'Customer not found'}), 404
+        query = text("""
+            SELECT 
+                id,
+                file_name,
+                file_url,
+                document_category,
+                uploaded_at
+            FROM "StreemLyne_MT"."Customer_Documents"
+            WHERE client_id = :client_id
+            ORDER BY uploaded_at DESC
+        """)
         
-        # Check permissions
-        if request.current_user.role in ['Sales', 'Staff']:
-            if customer.created_by != str(request.current_user.id) and customer.salesperson != request.current_user.full_name:
-                return jsonify({'error': 'You do not have permission to view documents for this customer'}), 403
+        result = session.execute(query, {'client_id': int(customer_id)})
+        documents = result.fetchall()
         
-        drawings = session.query(DrawingDocument).filter_by(customer_id=customer_id).order_by(DrawingDocument.created_at.desc()).all()
-        
-        return jsonify([drawing.to_dict() for drawing in drawings]), 200
+        return jsonify([{
+            'id': doc.id,
+            'file_name': doc.file_name,
+            'file_url': doc.file_url,
+            'category': doc.document_category,
+            'uploaded_at': doc.uploaded_at.isoformat() if doc.uploaded_at else None
+        } for doc in documents]), 200
         
     except Exception as e:
         current_app.logger.exception(f"Error fetching drawings: {e}")
@@ -1007,26 +854,24 @@ def get_drawing_documents():
         session.close()
 
 
-@customer_bp.route('/drawings/<string:drawing_id>', methods=['DELETE', 'OPTIONS'])
+@customer_bp.route('/drawings/<int:drawing_id>', methods=['DELETE', 'OPTIONS'])
 @token_required
 def delete_drawing_document(drawing_id):
-    """Delete a drawing document (Manager/HR only)"""
+    """Delete a document"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        if request.current_user.role not in ['Manager', 'HR']:
-            return jsonify({'error': 'You do not have permission to delete documents'}), 403
+        delete_query = text("""
+            DELETE FROM "StreemLyne_MT"."Customer_Documents"
+            WHERE id = :document_id
+        """)
         
-        drawing = session.get(DrawingDocument, drawing_id)
-        if not drawing:
-            return jsonify({'error': 'Document not found'}), 404
-        
-        session.delete(drawing)
+        session.execute(delete_query, {'document_id': drawing_id})
         session.commit()
         
-        current_app.logger.info(f"Drawing document {drawing_id} deleted")
+        current_app.logger.info(f"Document {drawing_id} deleted")
         
         return jsonify({
             'success': True,
@@ -1040,104 +885,28 @@ def delete_drawing_document(drawing_id):
     finally:
         session.close()
 
-@customer_bp.route('/customers/debug-accepted', methods=['GET', 'OPTIONS'])
-# @token_required
-def debug_accepted_customers():
-    """Debug endpoint to see what's going on with Accepted stage"""
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-    
-    session = SessionLocal()
-    try:
-        # Get all customers in Accepted stage
-        customers_in_accepted = session.query(Customer).filter(
-            Customer.stage == 'Accepted'
-        ).all()
-        
-        debug_info = []
-        
-        for customer in customers_in_accepted:
-            # Get all projects for this customer
-            projects = session.query(Project).filter_by(customer_id=customer.id).all()
-            
-            project_info = []
-            for project in projects:
-                project_info.append({
-                    'id': project.id,
-                    'name': project.project_name,
-                    'type': project.project_type,
-                    'stage': project.stage
-                })
-            
-            debug_info.append({
-                'customer_id': customer.id,
-                'customer_name': customer.name,
-                'customer_stage': customer.stage,
-                'projects': project_info,
-                'projects_in_accepted': len([p for p in projects if p.stage == 'Accepted'])
-            })
-        
-        current_app.logger.info(f"🔍 Debug: Found {len(customers_in_accepted)} customers with stage='Accepted'")
-        
-        return jsonify({
-            'total_customers_in_accepted': len(customers_in_accepted),
-            'details': debug_info
-        }), 200
-        
-    except Exception as e:
-        current_app.logger.exception(f"❌ Debug error: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
 
-@customer_bp.route('/customers/<string:customer_id>/forms', methods=['GET', 'OPTIONS'])
+# ==========================================
+# FORMS ENDPOINTS (for compatibility)
+# ==========================================
+
+@customer_bp.route('/customers/<int:customer_id>/forms', methods=['GET', 'OPTIONS'])
 @token_required
 def get_customer_forms(customer_id):
-    """Get all form submissions for a specific customer"""
+    """Get all form submissions for a customer (returns empty for now)"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
-    session = SessionLocal()
-    try:
-        customer = session.get(Customer, customer_id)
-        if not customer:
-            return jsonify({'error': 'Customer not found'}), 404
-        
-        # Check permissions
-        if request.current_user.role in ['Sales', 'Staff']:
-            if customer.created_by != str(request.current_user.id) and customer.salesperson != request.current_user.full_name:
-                return jsonify({'error': 'You do not have permission to view forms for this customer'}), 403
-        
-        # Get all form submissions for this customer
-        forms = session.query(CustomerFormData).filter_by(
-            customer_id=customer_id
-        ).order_by(CustomerFormData.submitted_at.desc()).all()
-        
-        current_app.logger.info(f"📋 Found {len(forms)} form submissions for customer {customer_id}")
-        
-        result = []
-        for form in forms:
-            try:
-                form_data = json.loads(form.form_data) if form.form_data else {}
-                
-                result.append({
-                    'id': form.id,
-                    'submitted_at': form.submitted_at.isoformat() if form.submitted_at else None,
-                    'form_type': form_data.get('form_type', 'unknown'),
-                    'is_invoice': form_data.get('is_invoice', False),
-                    'is_receipt': form_data.get('is_receipt', False),
-                    'checklist_type': form_data.get('checklistType'),
-                    'approval_status': form.approval_status or 'approved',
-                    'form_data': form_data
-                })
-            except Exception as e:
-                current_app.logger.error(f"Error processing form {form.id}: {e}")
-                continue
-        
-        return jsonify(result), 200
-        
-    except Exception as e:
-        current_app.logger.exception(f"Error fetching customer forms: {e}")
-        return jsonify({'error': 'Failed to fetch forms'}), 500
-    finally:
-        session.close()
+    # Forms are not implemented in StreemLyne_MT schema
+    # Return empty array for compatibility
+    return jsonify([]), 200
+
+
+@customer_bp.route('/forms/<int:form_id>', methods=['DELETE', 'OPTIONS'])
+@token_required
+def delete_form_submission(form_id):
+    """Delete a form submission (not implemented)"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    return jsonify({'error': 'Forms are not implemented in this version'}), 501
