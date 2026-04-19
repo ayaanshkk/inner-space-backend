@@ -1,241 +1,430 @@
 """
-Manual Entry Routes - Adapted for StreemLyne_MT schema
-Handles cabinet dimension extraction and cutting list calculation
+Manual Cabinet Entry Routes - StreemLyne_MT schema
+Allows users to manually input cabinet dimensions and auto-calculates all components
+Similar to K Carc price generator workflow
 """
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify
 from sqlalchemy import text
 from datetime import datetime
 import logging
+from decimal import Decimal
 
 from ..db import SessionLocal
-from .auth_helpers import token_required, get_current_tenant_id, get_current_employee_id
+from .auth_helpers import token_required, get_current_tenant_id
 
-logger = logging.getLogger('ManualEntryRoutes')
+logger = logging.getLogger('ManualCabinetRoutes')
 
-manual_entry_bp = Blueprint('manual_entry', __name__)
-
-# Initialize calculators once
-dimension_extractor = None
-cabinet_calculator = None
-
-try:
-    from backend.dimension_extractor import DimensionExtractor
-    dimension_extractor = DimensionExtractor()
-    logger.info("✅ DimensionExtractor initialized")
-except Exception as e:
-    logger.error(f"Failed to initialize DimensionExtractor: {e}")
-
-try:
-    from backend.cabinet_calculator import CabinetCalculator
-    cabinet_calculator = CabinetCalculator()
-    logger.info("✅ CabinetCalculator initialized")
-except Exception as e:
-    logger.error(f"Failed to initialize CabinetCalculator: {e}")
+manual_cabinet_bp = Blueprint('manual_cabinet', __name__)
 
 
 # ==========================================
-# DIMENSION EXTRACTION (PHASE 1)
+# CABINET CALCULATION ENGINE
 # ==========================================
 
-@manual_entry_bp.route('/api/manual-entry/extract-dimensions', methods=['POST', 'OPTIONS'])
-@token_required
-def extract_dimensions():
+class CabinetCalculator:
     """
-    PHASE 1: Extract cabinet dimensions from drawing
-    Returns editable cabinet list for user confirmation
+    Calculates all components for a cabinet based on H x W x D dimensions
+    Formula-based approach matching K Carc price generator EXACTLY
+    
+    K Carc Formula Reference:
+    - Input: Height (C3), Width (D3), Depth (E3)
+    - Gables: Panel L = Height, Panel W = Depth
+    - Base: Panel L = Width - 36mm, Panel W = Depth - 70mm
+    - Top Rail: Panel L = Width - 36mm, Panel W = 100mm (fixed)
+    - Back: Panel L = Height, Panel W = Width - 36mm
+    - Shelf: Panel L = Width - 36mm, Panel W = Depth - 140mm
+    """
+    
+    # Standard material thickness (18mm for carcass panels)
+    CARCASS_THICKNESS = 18
+    
+    # Standard depths for different cabinet types
+    STANDARD_BASE_DEPTH = 500  # K Carc uses 500mm as standard
+    STANDARD_WALL_DEPTH = 320  # Standard wall cabinet depth
+    
+    def calculate_base_cabinet(self, height, width, depth=None):
+        """
+        Calculate all components for a base cabinet using K Carc formulas
+        
+        K Carc Formula Logic:
+        - Gables: Height × Depth
+        - Base: (Width - 36) × (Depth - 70)
+        - Top Rail: (Width - 36) × 100
+        - Back: Height × (Width - 36)
+        - Shelf: (Width - 36) × (Depth - 140)
+        
+        Args:
+            height: Cabinet height (mm) - C3 in K Carc
+            width: Cabinet width (mm) - D3 in K Carc
+            depth: Cabinet depth (mm) - E3 in K Carc (default 500mm)
+            
+        Returns:
+            dict: All components with quantities and dimensions
+        """
+        if depth is None:
+            depth = self.STANDARD_BASE_DEPTH  # 500mm like K Carc
+            
+        components = {
+            'carcass': [],
+            'backs': [],
+            'shelves': [],
+            'doors': [],
+            'hardware': []
+        }
+        
+        # GABLES (2x) - Left and Right sides
+        # K Carc Formula: Panel L = C3 (Height), Panel W = E3 (Depth)
+        gable_panel_l = height
+        gable_panel_w = depth
+        
+        components['carcass'].append({
+            'name': 'Gable - Right',
+            'panel_l': gable_panel_l,
+            'panel_w': gable_panel_w,
+            'thickness': self.CARCASS_THICKNESS,
+            'quantity': 1,
+            'edging_length_m': gable_panel_l / 1000,  # Panel L in meters
+            'material': '18mm MFC',
+            'notes': 'Front edge edging'
+        })
+        
+        components['carcass'].append({
+            'name': 'Gable - Left',
+            'panel_l': gable_panel_l,
+            'panel_w': gable_panel_w,
+            'thickness': self.CARCASS_THICKNESS,
+            'quantity': 1,
+            'edging_length_m': gable_panel_l / 1000,
+            'material': '18mm MFC',
+            'notes': 'Front edge edging'
+        })
+        
+        # BASE (1x)
+        # K Carc Formula: Panel L = D3-36 (Width - 36), Panel W = E3-70 (Depth - 70)
+        base_panel_l = width - 36
+        base_panel_w = depth - 70
+        
+        components['carcass'].append({
+            'name': 'Base',
+            'panel_l': base_panel_l,
+            'panel_w': base_panel_w,
+            'thickness': self.CARCASS_THICKNESS,
+            'quantity': 1,
+            'edging_length_m': base_panel_l / 1000,
+            'material': '18mm MFC',
+            'notes': 'Front edge edging'
+        })
+        
+        # TOP RAIL (1x)
+        # K Carc Formula: Panel L = D3-36 (Width - 36), Panel W = 100 (fixed)
+        top_rail_panel_l = width - 36
+        top_rail_panel_w = 100  # Fixed at 100mm in K Carc
+        
+        components['carcass'].append({
+            'name': 'Top Rail',
+            'panel_l': top_rail_panel_l,
+            'panel_w': top_rail_panel_w,
+            'thickness': self.CARCASS_THICKNESS,
+            'quantity': 1,
+            'edging_length_m': top_rail_panel_l / 1000,
+            'material': '18mm MFC',
+            'notes': 'Front edge edging'
+        })
+        
+        # BACK PANEL (1x)
+        # K Carc Formula: Panel L = C3 (Height), Panel W = D3-36 (Width - 36)
+        back_panel_l = height
+        back_panel_w = width - 36
+        
+        components['backs'].append({
+            'name': 'Back',
+            'panel_l': back_panel_l,
+            'panel_w': back_panel_w,
+            'thickness': 6,  # Back panels typically 6mm
+            'quantity': 1,
+            'edging_length_m': 0,  # No edging on backs in K Carc
+            'material': '6mm MDF',
+            'notes': 'No edging'
+        })
+        
+        # ADJUSTABLE SHELF (1x)
+        # K Carc Formula: Panel L = D3-36 (Width - 36), Panel W = E3-140 (Depth - 140)
+        shelf_panel_l = width - 36
+        shelf_panel_w = depth - 140
+        
+        components['shelves'].append({
+            'name': 'Shelf',
+            'panel_l': shelf_panel_l,
+            'panel_w': shelf_panel_w,
+            'thickness': self.CARCASS_THICKNESS,
+            'quantity': 1,
+            'edging_length_m': shelf_panel_l / 1000,
+            'material': '18mm MFC',
+            'notes': 'Front edge edging'
+        })
+        
+        # DOORS - Based on width
+        # Single door if width < 600mm, double doors if >= 600mm
+        door_height = height - 6  # 3mm top/bottom gap
+        
+        if width < 600:
+            # Single door
+            door_width = width - 6  # 3mm gap each side
+            components['doors'].append({
+                'name': 'Door',
+                'panel_l': door_height,
+                'panel_w': door_width,
+                'thickness': 18,
+                'quantity': 1,
+                'edging_length_m': ((door_height * 2) + (door_width * 2)) / 1000,  # All edges
+                'material': '18mm Door Panel',
+                'notes': 'All edges edged'
+            })
+            components['hardware'].append({
+                'name': 'Hinge - Overlay Sprung',
+                'quantity': 2,
+                'notes': '2 hinges for single door'
+            })
+        else:
+            # Double doors
+            door_width = (width / 2) - 4.5  # 3mm sides, 1.5mm center
+            components['doors'].append({
+                'name': 'Door - Left',
+                'panel_l': door_height,
+                'panel_w': door_width,
+                'thickness': 18,
+                'quantity': 1,
+                'edging_length_m': ((door_height * 2) + (door_width * 2)) / 1000,
+                'material': '18mm Door Panel',
+                'notes': 'All edges edged'
+            })
+            components['doors'].append({
+                'name': 'Door - Right',
+                'panel_l': door_height,
+                'panel_w': door_width,
+                'thickness': 18,
+                'quantity': 1,
+                'edging_length_m': ((door_height * 2) + (door_width * 2)) / 1000,
+                'material': '18mm Door Panel',
+                'notes': 'All edges edged'
+            })
+            components['hardware'].append({
+                'name': 'Hinge - Overlay Sprung',
+                'quantity': 4,
+                'notes': '2 hinges per door'
+            })
+        
+        # HARDWARE
+        components['hardware'].append({
+            'name': 'Legs 150',
+            'quantity': 1,
+            'notes': 'Set of 4 adjustable legs'
+        })
+        
+        components['hardware'].append({
+            'name': 'Shelf Pegs Plastic',
+            'quantity': 8,
+            'notes': '4 pegs per shelf position'
+        })
+        
+        # Calculate total area using K Carc method: ROUNDUP((Panel_L * Panel_W)/(1000*1000), 2)
+        total_area = self._calculate_total_area_kcarc(components)
+        
+        return {
+            'cabinet_type': 'Kitchen Base',
+            'dimensions': {
+                'height': height,
+                'width': width,
+                'depth': depth
+            },
+            'components': components,
+            'summary': {
+                'total_panels': self._count_panels(components),
+                'total_area_m2': round(total_area, 3),
+                'door_count': 1 if width < 600 else 2
+            }
+        }
+    
+    def calculate_wall_cabinet(self, height, width, depth=None):
+        """
+        Calculate components for a wall cabinet (similar to base but shallower)
+        Uses same formulas as base cabinet with different default depth
+        """
+        if depth is None:
+            depth = self.STANDARD_WALL_DEPTH
+        
+        # Use base cabinet calculation with wall depth
+        result = self.calculate_base_cabinet(height, width, depth)
+        result['cabinet_type'] = 'Kitchen Wall Cabinet'
+        
+        # Replace legs with wall brackets in hardware
+        for i, item in enumerate(result['components']['hardware']):
+            if item['name'] == 'Legs 150':
+                result['components']['hardware'][i] = {
+                    'name': 'Wall Mounting Bracket',
+                    'quantity': 2,
+                    'notes': 'Heavy duty wall brackets'
+                }
+        
+        return result
+    
+    def _calculate_total_area_kcarc(self, components):
+        """
+        Calculate total area in m² using K Carc formula
+        Formula: ROUNDUP((Panel_L * Panel_W)/(1000*1000), 2)
+        """
+        import math
+        total_area = 0
+        
+        for category in ['carcass', 'backs', 'shelves', 'doors']:
+            for item in components.get(category, []):
+                panel_l = item.get('panel_l', 0)
+                panel_w = item.get('panel_w', 0)
+                quantity = item.get('quantity', 1)
+                
+                # K Carc formula: ROUNDUP((L * W)/(1000*1000), 2)
+                area_per_item = math.ceil(((panel_l * panel_w) / 1_000_000) * 100) / 100
+                total_area += area_per_item * quantity
+        
+        return total_area
+    
+    def _count_panels(self, components):
+        """Count total number of panels/components"""
+        count = 0
+        for category in ['carcass', 'backs', 'shelves', 'doors']:
+            for item in components.get(category, []):
+                count += item.get('quantity', 1)
+        return count
+
+
+# Initialize calculator
+calculator = CabinetCalculator()
+
+
+# ==========================================
+# API ROUTES
+# ==========================================
+
+@manual_cabinet_bp.route('/api/manual-cabinet/calculate', methods=['POST', 'OPTIONS'])
+@token_required
+def calculate_cabinet():
+    """
+    Calculate cabinet components from manual dimensions (K Carc style)
+    
+    Request body:
+    {
+        "cabinet_type": "base" | "wall",
+        "height": 400,
+        "width": 1200,
+        "depth": 500 (optional, defaults: base=500mm, wall=320mm),
+        "project_name": "Kitchen Project",
+        "save": true (optional - save to database)
+    }
     """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-        
-    try:
-        if not dimension_extractor:
-            return jsonify({
-                "success": False,
-                "error": "DimensionExtractor not initialized"
-            }), 500
-        
-        if 'file' not in request.files:
-            return jsonify({"success": False, "error": "No file uploaded"}), 400
-        
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({"success": False, "error": "No file selected"}), 400
-        
-        # Read file
-        image_bytes = file.read()
-        
-        if len(image_bytes) == 0:
-            return jsonify({"success": False, "error": "Empty file"}), 400
-        
-        logger.info(f"Extracting dimensions from: {file.filename}")
-        
-        # Extract dimensions
-        result = dimension_extractor.extract_dimensions_from_layout(image_bytes)
-        
-        if result.get('error'):
-            return jsonify({
-                "success": False,
-                "error": result['error']
-            }), 500
-        
-        # Return editable cabinet list
-        return jsonify({
-            "success": True,
-            "total_width": result.get('total_width'),
-            "cabinets": result.get('cabinets', []),
-            "layout_notes": result.get('layout_notes', ''),
-            "message": "Dimensions extracted successfully. Please review and edit if needed."
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Dimension extraction failed: {str(e)}", exc_info=True)
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-# ==========================================
-# CABINET CALCULATION (PHASE 2)
-# ==========================================
-
-@manual_entry_bp.route('/api/manual-entry/calculate-cabinets', methods=['POST', 'OPTIONS'])
-@token_required
-def calculate_cabinets():
-    """
-    PHASE 2: Calculate all components from confirmed cabinet list
-    User has edited/confirmed the dimensions
-    Optionally saves to database if document_id is provided
-    """
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-        
+    
     session = SessionLocal()
+    
     try:
-        if not cabinet_calculator:
-            return jsonify({
-                "success": False,
-                "error": "CabinetCalculator not initialized"
-            }), 500
-        
-        tenant_id = get_current_tenant_id()
-        
         data = request.get_json()
         
-        if not data or 'cabinets' not in data:
+        # Validate required fields
+        if not data:
+            return jsonify({"success": False, "error": "No data provided"}), 400
+        
+        cabinet_type = data.get('cabinet_type', 'base').lower()
+        height = data.get('height')
+        width = data.get('width')
+        depth = data.get('depth')
+        project_name = data.get('project_name', 'Unnamed Project')
+        should_save = data.get('save', False)
+        
+        # Validate dimensions
+        if not height or not width:
             return jsonify({
                 "success": False,
-                "error": "No cabinet data provided"
+                "error": "Height and width are required"
             }), 400
         
-        cabinets = data['cabinets']
-        document_id = data.get('document_id')  # Optional: save to database
-        
-        if not isinstance(cabinets, list) or len(cabinets) == 0:
+        try:
+            height = float(height)
+            width = float(width)
+            if depth:
+                depth = float(depth)
+        except ValueError:
             return jsonify({
                 "success": False,
-                "error": "Invalid cabinet list"
+                "error": "Invalid dimensions - must be numbers"
             }), 400
         
-        logger.info(f"Calculating components for {len(cabinets)} cabinets")
+        # Calculate based on cabinet type
+        if cabinet_type == 'base':
+            result = calculator.calculate_base_cabinet(height, width, depth)
+        elif cabinet_type == 'wall':
+            result = calculator.calculate_wall_cabinet(height, width, depth)
+        else:
+            return jsonify({
+                "success": False,
+                "error": f"Unknown cabinet type: {cabinet_type}. Use 'base' or 'wall'"
+            }), 400
         
-        # Calculate all components
-        components = cabinet_calculator.calculate_complete_kitchen(cabinets)
-        
-        # Format for frontend
-        results = cabinet_calculator.format_for_frontend(components)
-        
-        # Calculate summary
-        total_pieces = sum(cat.get('total_pieces', 0) for cat in results.values())
-        total_area = sum(cat.get('total_area', 0) for cat in results.values())
-        categories_with_items = len([c for c in results.values() if c.get('total_pieces', 0) > 0])
-        
-        # Save to database if document_id provided
-        if document_id:
-            try:
-                # Delete existing cutting list items for this document
-                delete_query = text("""
-                    DELETE FROM "StreemLyne_MT"."Drawing_Cutting_List"
-                    WHERE document_id = :document_id
-                """)
-                session.execute(delete_query, {'document_id': int(document_id)})
-                
-                # Insert new cutting list items
-                insert_query = text("""
-                    INSERT INTO "StreemLyne_MT"."Drawing_Cutting_List" (
-                        document_id,
-                        tenant_id,
-                        component_type,
-                        part_name,
-                        width,
-                        height,
-                        depth,
-                        quantity,
-                        thickness,
-                        edge_banding,
-                        area_m2,
-                        section_index,
-                        created_at
-                    ) VALUES (
-                        :document_id,
-                        :tenant_id,
-                        :component_type,
-                        :part_name,
-                        :width,
-                        :height,
-                        :depth,
-                        :quantity,
-                        :thickness,
-                        :edge_banding,
-                        :area_m2,
-                        :section_index,
-                        :created_at
-                    )
-                """)
-                
-                section_index = 0
-                for category_name, category_data in results.items():
-                    items = category_data.get('items', [])
-                    for item in items:
-                        session.execute(insert_query, {
-                            'document_id': int(document_id),
-                            'tenant_id': tenant_id,
-                            'component_type': category_name,
-                            'part_name': item.get('description', ''),
-                            'width': item.get('width', 0),
-                            'height': item.get('height', 0),
-                            'depth': item.get('depth'),
-                            'quantity': item.get('quantity', 1),
-                            'thickness': item.get('thickness'),
-                            'edge_banding': item.get('edge_banding'),
-                            'area_m2': item.get('area', 0),
-                            'section_index': section_index,
-                            'created_at': datetime.utcnow()
-                        })
-                        section_index += 1
-                
-                session.commit()
-                logger.info(f"Saved {section_index} cutting list items for document {document_id}")
-                
-            except Exception as save_error:
-                session.rollback()
-                logger.error(f"Failed to save cutting list: {save_error}", exc_info=True)
-                # Don't fail the request if save fails - still return the calculated results
-        
-        logger.info(f"Generated {total_pieces} total components across {categories_with_items} categories")
+        # Optionally save to database
+        saved_id = None
+        if should_save:
+            tenant_id = get_current_tenant_id()
+            
+            # Save cabinet calculation
+            insert_query = text("""
+                INSERT INTO "StreemLyne_MT"."Manual_Cabinet_Calculations" (
+                    tenant_id,
+                    project_name,
+                    cabinet_type,
+                    height,
+                    width,
+                    depth,
+                    total_panels,
+                    total_area_m2,
+                    calculation_data,
+                    created_at
+                ) VALUES (
+                    :tenant_id,
+                    :project_name,
+                    :cabinet_type,
+                    :height,
+                    :width,
+                    :depth,
+                    :total_panels,
+                    :total_area_m2,
+                    :calculation_data,
+                    :created_at
+                )
+                RETURNING id
+            """)
+            
+            import json
+            result_insert = session.execute(insert_query, {
+                'tenant_id': tenant_id,
+                'project_name': project_name,
+                'cabinet_type': cabinet_type,
+                'height': height,
+                'width': width,
+                'depth': result['dimensions']['depth'],
+                'total_panels': result['summary']['total_panels'],
+                'total_area_m2': result['summary']['total_area_m2'],
+                'calculation_data': json.dumps(result),
+                'created_at': datetime.utcnow()
+            })
+            
+            saved_id = result_insert.fetchone()[0]
+            session.commit()
+            logger.info(f"Saved cabinet calculation ID: {saved_id}")
         
         return jsonify({
             "success": True,
-            "summary": {
-                "total_pieces": total_pieces,
-                "total_area": round(total_area, 2),
-                "categories": categories_with_items,
-                "cabinet_count": len(cabinets)
-            },
-            "results": results,
-            "dxf_content": None,  # TODO: Generate DXF if needed
-            "message": f"Successfully generated cutting list for {len(cabinets)} cabinets",
-            "saved_to_database": bool(document_id)
+            "result": result,
+            "saved_id": saved_id,
+            "message": f"Successfully calculated {result['cabinet_type']}"
         }), 200
         
     except Exception as e:
@@ -249,85 +438,59 @@ def calculate_cabinets():
         session.close()
 
 
-# ==========================================
-# CUTTING LIST RETRIEVAL
-# ==========================================
-
-@manual_entry_bp.route('/api/manual-entry/cutting-list/<int:document_id>', methods=['GET', 'OPTIONS'])
+@manual_cabinet_bp.route('/api/manual-cabinet/history', methods=['GET', 'OPTIONS'])
 @token_required
-def get_cutting_list(document_id):
-    """Get saved cutting list for a document"""
+def get_calculation_history():
+    """Get saved cabinet calculations"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-        
+    
     session = SessionLocal()
+    
     try:
         tenant_id = get_current_tenant_id()
         
         query = text("""
             SELECT 
                 id,
-                component_type,
-                part_name,
-                width,
+                project_name,
+                cabinet_type,
                 height,
+                width,
                 depth,
-                quantity,
-                thickness,
-                edge_banding,
-                area_m2,
-                section_index,
+                drawer_count,
+                total_panels,
+                total_area_m2,
                 created_at
-            FROM "StreemLyne_MT"."Drawing_Cutting_List"
-            WHERE document_id = :document_id
-            ORDER BY section_index
+            FROM "StreemLyne_MT"."Manual_Cabinet_Calculations"
+            WHERE tenant_id = :tenant_id
+            ORDER BY created_at DESC
+            LIMIT 50
         """)
         
-        result = session.execute(query, {'document_id': document_id})
-        items = result.fetchall()
+        result = session.execute(query, {'tenant_id': tenant_id})
+        calculations = result.fetchall()
         
-        if not items:
-            return jsonify({
-                "success": True,
-                "items": [],
-                "message": "No cutting list found for this document"
-            }), 200
-        
-        # Group by component type
-        grouped = {}
-        for item in items:
-            component_type = item.component_type
-            if component_type not in grouped:
-                grouped[component_type] = {
-                    'component_type': component_type,
-                    'items': [],
-                    'total_pieces': 0,
-                    'total_area': 0
-                }
-            
-            grouped[component_type]['items'].append({
-                'id': item.id,
-                'description': item.part_name,
-                'width': float(item.width) if item.width else 0,
-                'height': float(item.height) if item.height else 0,
-                'depth': float(item.depth) if item.depth else None,
-                'quantity': item.quantity,
-                'thickness': float(item.thickness) if item.thickness else None,
-                'edge_banding': item.edge_banding,
-                'area': float(item.area_m2) if item.area_m2 else 0
-            })
-            
-            grouped[component_type]['total_pieces'] += item.quantity or 1
-            grouped[component_type]['total_area'] += float(item.area_m2) if item.area_m2 else 0
+        history = [{
+            'id': calc.id,
+            'project_name': calc.project_name,
+            'cabinet_type': calc.cabinet_type,
+            'height': float(calc.height),
+            'width': float(calc.width),
+            'depth': float(calc.depth),
+            'drawer_count': calc.drawer_count,
+            'total_panels': calc.total_panels,
+            'total_area_m2': float(calc.total_area_m2),
+            'created_at': calc.created_at.isoformat()
+        } for calc in calculations]
         
         return jsonify({
             "success": True,
-            "results": grouped,
-            "total_items": len(items)
+            "history": history
         }), 200
         
     except Exception as e:
-        logger.error(f"Error fetching cutting list: {e}", exc_info=True)
+        logger.error(f"Error fetching history: {e}", exc_info=True)
         return jsonify({
             "success": False,
             "error": str(e)
@@ -336,55 +499,69 @@ def get_cutting_list(document_id):
         session.close()
 
 
-# ==========================================
-# REFERENCE DATA
-# ==========================================
-
-@manual_entry_bp.route('/api/manual-entry/cabinet-types', methods=['GET', 'OPTIONS'])
-def get_cabinet_types():
-    """Get available cabinet types and their descriptions"""
+@manual_cabinet_bp.route('/api/manual-cabinet/<int:calculation_id>', methods=['GET', 'DELETE', 'OPTIONS'])
+@token_required
+def manage_calculation(calculation_id):
+    """Get or delete a specific calculation"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-        
-    cabinet_types = {
-        'standard_base': {
-            'name': 'Standard Base',
-            'description': 'Regular base cabinet with doors and shelf',
-            'typical_width': '700-1000mm'
-        },
-        'sink_base': {
-            'name': 'Sink Base',
-            'description': 'Base cabinet for sink (no shelf, lower back)',
-            'typical_width': '600-900mm'
-        },
-        'drawer_base': {
-            'name': 'Drawer Base',
-            'description': 'Cabinet with multiple drawers',
-            'typical_width': '400-600mm'
-        },
-        'narrow': {
-            'name': 'Narrow Cabinet',
-            'description': 'Slim cabinet for spices/bottles',
-            'typical_width': '200-400mm'
-        },
-        'wide_base': {
-            'name': 'Wide Base',
-            'description': 'Extra wide cabinet',
-            'typical_width': '1000mm+'
-        },
-        'filler': {
-            'name': 'Filler Panel',
-            'description': 'Decorative filler piece',
-            'typical_width': '< 150mm'
-        },
-        'corner_l': {
-            'name': 'L-Corner',
-            'description': 'L-shaped corner cabinet (special)',
-            'typical_width': 'Variable'
-        }
-    }
     
-    return jsonify({
-        "success": True,
-        "cabinet_types": cabinet_types
-    }), 200
+    session = SessionLocal()
+    
+    try:
+        tenant_id = get_current_tenant_id()
+        
+        if request.method == 'GET':
+            query = text("""
+                SELECT calculation_data
+                FROM "StreemLyne_MT"."Manual_Cabinet_Calculations"
+                WHERE id = :id AND tenant_id = :tenant_id
+            """)
+            
+            result = session.execute(query, {
+                'id': calculation_id,
+                'tenant_id': tenant_id
+            })
+            
+            row = result.fetchone()
+            
+            if not row:
+                return jsonify({
+                    "success": False,
+                    "error": "Calculation not found"
+                }), 404
+            
+            import json
+            calculation_data = json.loads(row.calculation_data)
+            
+            return jsonify({
+                "success": True,
+                "calculation": calculation_data
+            }), 200
+        
+        elif request.method == 'DELETE':
+            delete_query = text("""
+                DELETE FROM "StreemLyne_MT"."Manual_Cabinet_Calculations"
+                WHERE id = :id AND tenant_id = :tenant_id
+            """)
+            
+            session.execute(delete_query, {
+                'id': calculation_id,
+                'tenant_id': tenant_id
+            })
+            session.commit()
+            
+            return jsonify({
+                "success": True,
+                "message": "Calculation deleted"
+            }), 200
+            
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error managing calculation: {e}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+    finally:
+        session.close()

@@ -226,21 +226,26 @@ def register():
 
 @auth_bp.route('/auth/login', methods=['POST'])
 def login():
-    """Login user"""
+    """Login user with username or email"""
     session = SessionLocal()
     try:
         data = request.get_json() or {}
-        if not data.get('email') or not data.get('password'):
-            return jsonify({'error': 'Email and password required'}), 400
+        
+        # ✅ Accept either 'username' or 'email' for backwards compatibility
+        identifier = data.get('username') or data.get('email')
+        password = data.get('password')
+        
+        if not identifier or not password:
+            return jsonify({'error': 'Username/email and password required'}), 400
 
-        email = data['email'].lower().strip()
-        password = data['password']
+        identifier = identifier.lower().strip()
 
-        # Query user and employee info
+        # ✅ Query user by username OR email (handle NULL emails)
         query = text("""
             SELECT 
                 u.user_id,
                 u.employee_id,
+                u.user_name as username,
                 u.password,
                 e.tenant_id,
                 e.employee_name,
@@ -248,20 +253,21 @@ def login():
                 e.role_ids
             FROM "StreemLyne_MT"."User_Master" u
             JOIN "StreemLyne_MT"."Employee_Master" e ON u.employee_id = e.employee_id
-            WHERE e.email = :email
+            WHERE LOWER(u.user_name) = :identifier 
+               OR (e.email IS NOT NULL AND LOWER(e.email) = :identifier)
         """)
         
-        result = session.execute(query, {'email': email})
+        result = session.execute(query, {'identifier': identifier})
         user = result.fetchone()
 
         if not user:
-            current_app.logger.warning(f"❌ Login failed - user not found: {email}")
-            return jsonify({'error': 'Invalid email or password'}), 401
+            current_app.logger.warning(f"❌ Login failed - user not found: {identifier}")
+            return jsonify({'error': 'Invalid username/email or password'}), 401
 
         # Verify password
         if not check_password_hash(user.password, password):
-            current_app.logger.warning(f"❌ Login failed - invalid password: {email}")
-            return jsonify({'error': 'Invalid email or password'}), 401
+            current_app.logger.warning(f"❌ Login failed - invalid password: {identifier}")
+            return jsonify({'error': 'Invalid username/email or password'}), 401
 
         # Generate JWT token
         payload = generate_token_payload(
@@ -273,7 +279,7 @@ def login():
         )
         token = create_jwt_token(payload)
 
-        current_app.logger.info(f"✅ Login successful: {email}")
+        current_app.logger.info(f"✅ Login successful: {identifier}")
 
         return jsonify({
             'success': True,
@@ -283,9 +289,17 @@ def login():
                 'id': user.employee_id,
                 'employee_id': user.employee_id,
                 'email': user.email,
+                'username': user.username,
                 'name': user.employee_name,
+                'full_name': user.employee_name,
+                'first_name': user.employee_name.split()[0] if user.employee_name else '',
+                'last_name': ' '.join(user.employee_name.split()[1:]) if user.employee_name and len(user.employee_name.split()) > 1 else '',
+                'role': user.role_ids,
                 'tenant_id': user.tenant_id,
-                'role_ids': user.role_ids
+                'role_ids': user.role_ids,
+                'is_active': True,
+                'is_verified': True,
+                'created_at': datetime.utcnow().isoformat()
             }
         }), 200
         
@@ -613,7 +627,7 @@ def invite_user():
         
         session.execute(insert_user, {
             'employee_id': employee_id,
-            'user_name': email,
+            'user_name': email.split('@')[0],  # Default username from email prefix
             'invite_token': invitation_token,
             'created_at': datetime.utcnow()
         })
