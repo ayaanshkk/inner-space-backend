@@ -265,7 +265,8 @@ def login():
             return jsonify({'error': 'Invalid username/email or password'}), 401
 
         # Verify password
-        if not check_password_hash(user.password, password):
+        # ⚠️ TEMPORARY: Plain text password comparison (NOT SECURE - FIX IN PRODUCTION)
+        if user.password != password:
             current_app.logger.warning(f"❌ Login failed - invalid password: {identifier}")
             return jsonify({'error': 'Invalid username/email or password'}), 401
 
