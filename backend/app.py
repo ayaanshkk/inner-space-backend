@@ -88,8 +88,7 @@ def create_app():
         auth_routes, db_routes,
         notification_routes, assignment_routes,
         customer_routes, file_routes,
-        job_routes, action_items_routes, manual_entry_routes, 
-        analysis_routes
+        job_routes, action_items_routes, manual_entry_routes, # materials_routes, analysis_routes
     )
 
     app.register_blueprint(auth_routes.auth_bp)
@@ -102,7 +101,7 @@ def create_app():
     app.register_blueprint(job_routes.job_bp)
     app.register_blueprint(action_items_routes.action_items_bp)
     app.register_blueprint(manual_entry_routes.manual_cabinet_bp)
-    app.register_blueprint(analysis_routes.analysis_bp)
+    # app.register_blueprint(analysis_routes.analysis_bp)
     
 
     # ============================================

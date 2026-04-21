@@ -53,9 +53,9 @@ def reset_password(username, new_password):
         session.close()
 
 if __name__ == "__main__":
-    # Reset password for uwais.innerspace
-    username = "uwais.innerspace"
-    new_password = "InnerSpace123!"
+    # Reset password for mansoor.innerspace
+    username = "mansoor.innerspace"
+    new_password = "mansoor123"
     
     print(f"Resetting password for: {username}")
     print(f"New password will be: {new_password}")
