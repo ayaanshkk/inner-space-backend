@@ -200,8 +200,8 @@ def create_customer():
         
         result = session.execute(insert_query, {
             'tenant_id': tenant_id,
-            'company_name': name if is_company else None,
-            'contact_name': name if not is_company else data.get('contact_name'),
+            'company_name': data.get('client_company_name') or name,
+            'contact_name': data.get('contact_name') or name,
             'phone': data.get('phone'),
             'mobile': data.get('mobile'),
             'email': data.get('email', ''),
