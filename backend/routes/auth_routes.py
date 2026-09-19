@@ -128,7 +128,7 @@ def admin_required(f):
 # --- Routes ---
 
 @auth_bp.route('/health', methods=['GET'])
-def health_check():
+def auth_health_check():
     return {
         'status': 'ok', 
         'message': 'Backend is running successfully!'

@@ -9,7 +9,7 @@ sys.path = [p for p in sys.path if "aztec_interiors" not in p.lower()]
 if PARENT not in sys.path:
     sys.path.insert(0, PARENT)
 
-from flask import Flask, request, jsonify
+from flask import Flask, app, request, jsonify
 from flask_cors import CORS
 import os
 from dotenv import load_dotenv
@@ -76,10 +76,6 @@ def create_app():
         resp.headers["Access-Control-Allow-Headers"] = "*"
         return resp
 
-    # ============================================
-    # ❌ MOCK AUTH REMOVED - Using Real JWT Auth
-    # ============================================
-    # The @token_required decorator in auth_routes.py handles authentication
 
     # ============================================
     # BLUEPRINTS
@@ -88,9 +84,9 @@ def create_app():
         auth_routes, db_routes,
         notification_routes, assignment_routes,
         customer_routes, file_routes,
-        job_routes, action_items_routes, manual_entry_routes, # materials_routes, analysis_routes
+        job_routes, action_items_routes, manual_cabinet, # materials_routes, analysis_routes
     )
-
+    
     app.register_blueprint(auth_routes.auth_bp)
     app.register_blueprint(customer_routes.customer_bp)
     app.register_blueprint(db_routes.db_bp)
@@ -100,10 +96,9 @@ def create_app():
     # app.register_blueprint(materials_routes.materials_bp)
     app.register_blueprint(job_routes.job_bp)
     app.register_blueprint(action_items_routes.action_items_bp)
-    app.register_blueprint(manual_entry_routes.manual_cabinet_bp)
+    app.register_blueprint(manual_cabinet.manual_cabinet_bp)
     # app.register_blueprint(analysis_routes.analysis_bp)
-    
-
+        
     # ============================================
     # HEALTH CHECK
     # ============================================

@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cutting List</title>
+<style>
+  /* ── Reset + base ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: Arial, sans-serif;
+    font-size: 11px;
+    background: #e5e5e5;
+    color: #000;
+  }
+
+  /* ── Toolbar (screen only) ── */
+  #toolbar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 44px;
+    background: #1f3864;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 16px;
+    z-index: 100;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  }
+  #toolbar span {
+    color: #fff;
+    font-size: 13px;
+    font-weight: bold;
+    flex: 1;
+  }
+  #toolbar button {
+    padding: 6px 16px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: bold;
+  }
+  #btn-pdf  { background: #27ae60; color: #fff; }
+  #btn-pdf:hover { background: #219150; }
+  #btn-reset { background: #e74c3c; color: #fff; }
+  #btn-reset:hover { background: #c0392b; }
+  #btn-add-row { background: #2980b9; color: #fff; }
+  #btn-add-row:hover { background: #2471a3; }
+
+  /* ── Page wrapper ── */
+  #page-wrapper {
+    margin: 56px auto 20px;
+    width: 210mm;
+    background: #fff;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+  }
+
+  /* ── A4 page ── */
+  .page {
+    width: 210mm;
+    min-height: 297mm;
+    padding: 6mm 6mm 4mm;
+    background: #fff;
+  }
+
+  /* ── Header grid ── */
+  .header-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 120px;
+    border-left: 1.5px solid #000;
+    border-top: 1.5px solid #000;
+    margin-bottom: 3px;
+  }
+  .header-col { display: flex; flex-direction: column; }
+  .header-row {
+    display: grid;
+    grid-template-columns: 90px 1fr;
+    border-bottom: 1px solid #000;
+    border-right: 1px solid #000;
+  }
+  .header-row .lbl {
+    font-weight: bold;
+    font-size: 9px;
+    padding: 2px 3px;
+    border-right: 1px solid #000;
+    display: flex;
+    align-items: center;
+    background: #f7f7f7;
+  }
+  .header-row .val {
+    padding: 2px 4px;
+    font-size: 9px;
+    display: flex;
+    align-items: center;
+    min-height: 16px;
+  }
+  .header-row .val[contenteditable="true"] {
+    outline: none;
+    cursor: text;
+  }
+  .header-row .val[contenteditable="true"]:focus {
+    background: #fffbe6;
+  }
+  .date-box {
+    border-right: 1.5px solid #000;
+    border-bottom: 1px solid #000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+    font-size: 11px;
+    padding: 4px;
+    grid-row: 1 / 6;
+    text-align: center;
+    background: #f7f7f7;
+  }
+  .date-box .date-val {
+    font-size: 13px;
+    font-weight: bold;
+  }
+
+  /* ── Main cutting list grid ── */
+  .cl-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border: 1.5px solid #000;
+    border-bottom: none;
+  }
+
+  .cl-half {
+    display: flex;
+    flex-direction: column;
+  }
+  .cl-half:first-child {
+    border-right: 1.5px solid #000;
+  }
+
+  /* ── Each section within a half ── */
+  .cl-section {
+    display: flex;
+    border-bottom: 1.5px solid #000;
+    min-height: 28mm;
+  }
+
+  .section-label {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    font-weight: bold;
+    font-size: 10px;
+    letter-spacing: 1px;
+    background: #1f3864;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px 3px;
+    min-width: 18px;
+    text-transform: uppercase;
+    border-right: 1px solid #000;
+  }
+
+  .section-rows {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .cl-row {
+    display: grid;
+    grid-template-columns: 22px 1fr;
+    border-bottom: 1px solid #ccc;
+    min-height: 8mm;
+    align-items: stretch;
+  }
+  .cl-row:last-child {
+    border-bottom: none;
+  }
+
+  .row-num {
+    font-size: 9px;
+    color: #555;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-right: 1px solid #ddd;
+    background: #fafafa;
+    font-weight: bold;
+  }
+
+  .row-dim {
+    font-size: 10px;
+    padding: 3px 5px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
+  /* Editable dim cells */
+  .dim-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .dim-cell input {
+    width: 42px;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    text-align: center;
+    font-size: 10px;
+    font-family: Arial, sans-serif;
+    padding: 1px 2px;
+    background: transparent;
+    color: #000;
+  }
+  .dim-cell input:focus {
+    border-color: #2980b9;
+    background: #fffbe6;
+    outline: none;
+  }
+  .dim-sep {
+    font-size: 10px;
+    color: #333;
+    font-weight: bold;
+  }
+  .qty-cell input {
+    width: 28px;
+  }
+  .panel-name {
+    font-size: 9px;
+    color: #666;
+    align-self: center;
+    min-width: 50px;
+  }
+
+  .add-row-btn {
+    font-size: 9px;
+    color: #2980b9;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 2px 5px;
+    align-self: flex-start;
+    margin: 1px 0;
+  }
+  .add-row-btn:hover { text-decoration: underline; }
+
+  .del-row-btn {
+    font-size: 9px;
+    color: #e74c3c;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0 3px;
+    line-height: 1;
+    display: none;
+  }
+  .cl-row:hover .del-row-btn { display: inline; }
+
+  /* ── Sheet summary row ── */
+  .sheet-summary {
+    border: 1.5px solid #000;
+    border-top: none;
+    padding: 3px 8px;
+    font-weight: bold;
+    font-size: 10px;
+    background: #f0f0f0;
+  }
+
+  /* ── Bottom accessories row ── */
+  .acc-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr 1fr;
+    border: 1.5px solid #000;
+    border-top: none;
+  }
+  .acc-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 4px 3px;
+    border-right: 1px solid #000;
+    min-height: 12mm;
+    text-align: center;
+  }
+  .acc-box:last-child { border-right: none; }
+  .acc-box .acc-label {
+    font-weight: bold;
+    font-size: 9px;
+    margin-bottom: 2px;
+  }
+  .acc-box .acc-val {
+    font-size: 11px;
+    font-weight: bold;
+    color: #1f3864;
+    min-width: 30px;
+    text-align: center;
+    border-bottom: 1px solid #999;
+    outline: none;
+    background: transparent;
+  }
+
+  /* ── Print styles ── */
+  @media print {
+    @page {
+      size: A4 portrait;
+      margin: 8mm 6mm;
+    }
+    body { background: #fff; }
+    #toolbar { display: none !important; }
+    #page-wrapper {
+      margin: 0;
+      box-shadow: none;
+      width: 100%;
+    }
+    .page { width: 100%; padding: 0; }
+    input, [contenteditable] { border: none !important; background: transparent !important; }
+    .add-row-btn, .del-row-btn { display: none !important; }
+    .dim-cell input:focus, .header-row .val:focus { background: transparent; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ── Toolbar ── -->
+<div id="toolbar">
+  <span>Cutting List Preview</span>
+  <button id="btn-add-row" onclick="addRowPrompt()">+ Add Row</button>
+  <button id="btn-reset" onclick="resetData()">↺ Reset</button>
+  <button id="btn-pdf" onclick="window.print()">⬇ Export PDF</button>
+</div>
+
+<!-- ── Page ── -->
+<div id="page-wrapper">
+<div class="page" id="main-page">
+
+  <!-- Header -->
+  <div class="header-grid" id="header-grid">
+    <!-- Left col -->
+    <div class="header-col">
+      <div class="header-row"><div class="lbl">CUSTOMER NAME</div><div class="val" contenteditable="true" id="h-customer"></div></div>
+      <div class="header-row"><div class="lbl">HOME ADDRESS</div><div class="val" contenteditable="true" id="h-address"></div></div>
+      <div class="header-row"><div class="lbl">KITCHEN</div><div class="val" contenteditable="true" id="h-kitchen"></div></div>
+      <div class="header-row"><div class="lbl">MODULAR</div><div class="val" contenteditable="true" id="h-modular"></div></div>
+      <div class="header-row"><div class="lbl">SLIDING</div><div class="val" contenteditable="true" id="h-sliding"></div></div>
+    </div>
+    <!-- Right col -->
+    <div class="header-col">
+      <div class="header-row"><div class="lbl">FITTING DATE</div><div class="val" contenteditable="true" id="h-fitting"></div></div>
+      <div class="header-row"><div class="lbl">OUTSIDE WOOD</div><div class="val" contenteditable="true" id="h-outside"></div></div>
+      <div class="header-row"><div class="lbl">CARCASE WOOD</div><div class="val" contenteditable="true" id="h-carcase"></div></div>
+      <div class="header-row"><div class="lbl">DOOR WOOD</div><div class="val" contenteditable="true" id="h-doorwood"></div></div>
+      <div class="header-row"><div class="lbl">READYMADE DOOR</div><div class="val" contenteditable="true" id="h-readymade"></div></div>
+    </div>
+    <!-- Date box -->
+    <div class="date-box">
+      <div>DATE</div>
+      <div class="date-val" contenteditable="true" id="h-date"></div>
+    </div>
+  </div>
+
+  <!-- Main cutting list -->
+  <div class="cl-grid" id="cl-grid">
+    <!-- Left half -->
+    <div class="cl-half" id="left-half">
+      <div class="cl-section" id="sec-GABLE">
+        <div class="section-label">GABLE</div>
+        <div class="section-rows" id="rows-GABLE"></div>
+      </div>
+      <div class="cl-section" id="sec-S/H">
+        <div class="section-label">S/H</div>
+        <div class="section-rows" id="rows-S/H"></div>
+      </div>
+      <div class="cl-section" id="sec-BACKS">
+        <div class="section-label">BACKS</div>
+        <div class="section-rows" id="rows-BACKS"></div>
+      </div>
+      <div class="cl-section" id="sec-END PANELS & INFILLS">
+        <div class="section-label">END PANELS &amp; INFILLS</div>
+        <div class="section-rows" id="rows-END PANELS & INFILLS"></div>
+      </div>
+    </div>
+    <!-- Right half -->
+    <div class="cl-half" id="right-half">
+      <div class="cl-section" id="sec-T/B & FIX SHELVES">
+        <div class="section-label">T/B &amp; FIX SHELVES</div>
+        <div class="section-rows" id="rows-T/B & FIX SHELVES"></div>
+      </div>
+      <div class="cl-section" id="sec-DRAWS">
+        <div class="section-label">DRAWS</div>
+        <div class="section-rows" id="rows-DRAWS"></div>
+      </div>
+      <div class="cl-section" id="sec-BRACES">
+        <div class="section-label">BRACES</div>
+        <div class="section-rows" id="rows-BRACES"></div>
+      </div>
+      <div class="cl-section" id="sec-DOORS & DRAW FACES">
+        <div class="section-label">DOORS &amp; DRAW FACES</div>
+        <div class="section-rows" id="rows-DOORS & DRAW FACES"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sheet summary -->
+  <div class="sheet-summary" id="sheet-summary"></div>
+
+  <!-- Accessories -->
+  <div class="acc-row">
+    <div class="acc-box"><div class="acc-label">S/Pegs</div><div class="acc-val" contenteditable="true" id="acc-spegs"></div></div>
+    <div class="acc-box"><div class="acc-label">Hinges</div><div class="acc-val" contenteditable="true" id="acc-hinges"></div></div>
+    <div class="acc-box"><div class="acc-label">Legs pack</div><div class="acc-val" contenteditable="true" id="acc-legs"></div></div>
+    <div class="acc-box"><div class="acc-label">Handles</div><div class="acc-val" contenteditable="true" id="acc-handles"></div></div>
+    <div class="acc-box"><div class="acc-label">Soft Close</div><div class="acc-val" contenteditable="true" id="acc-softclose"></div></div>
+  </div>
+
+</div><!-- .page -->
+</div><!-- #page-wrapper -->
+
+<script>
+// ── Global state ──────────────────────────────────────────────────────────────
+let cuttingData = null;
+
+const SECTION_ORDER_LEFT  = ['GABLE','S/H','BACKS','END PANELS & INFILLS'];
+const SECTION_ORDER_RIGHT = ['T/B & FIX SHELVES','DRAWS','BRACES','DOORS & DRAW FACES'];
+let lineCounters = {};  // global line numbers
+
+// ── Load data from URL param or window.CUTTING_LIST_DATA ──────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  const raw = window.__CUTTING_DATA__;
+  if (raw) {
+    loadData(raw);
+  } else {
+    // No data — show blank sheet ready to fill in
+    renderAllSections({});
+    updateSummary();
+  }
+});
+
+function loadData(data) {
+  cuttingData = data;
+
+  // Header fields
+  setField('h-customer', data.customer_name || '');
+  setField('h-address',  data.address || '');
+  setField('h-kitchen',  data.cabinet_type || '');
+  setField('h-modular',  data.project_name || '');
+  setField('h-sliding',  '');
+  setField('h-fitting',  data.fitting_date || '');
+  setField('h-outside',  data.outside_wood || '');
+  setField('h-carcase',  data.carcase_wood || '');
+  setField('h-doorwood', data.door_wood || '');
+  setField('h-readymade','');
+  setField('h-date',     data.date || new Date().toLocaleDateString('en-GB'));
+
+  // Accessories
+  const accs = data.accessories || [];
+  const accMap = {};
+  accs.forEach(a => { accMap[a.name] = a.qty; });
+  const spegs = accMap['Shelf Pegs Plastic'] || accMap['Shelf Pegs Metal Hafele 282.24.710'] || '';
+  const hinges = accMap['Overlay Splung'] || accMap['Hinge - Overlay Sprung'] || '';
+  const legs   = accMap['Legs 150'] || accMap['Legs 100'] || '';
+  const handles= accMap['sample'] || '';
+  const sc     = accMap['Overlay Softclose'] || '';
+
+  document.getElementById('acc-spegs').textContent    = spegs || '';
+  document.getElementById('acc-hinges').textContent   = hinges || '';
+  document.getElementById('acc-legs').textContent     = legs || '';
+  document.getElementById('acc-handles').textContent  = handles || '';
+  document.getElementById('acc-softclose').textContent= sc || '';
+
+  // Build section map
+  const secMap = {};
+  (data.sections || []).forEach(s => { secMap[s.category] = s.items || []; });
+
+  renderAllSections(secMap);
+  updateSummary(data.material_summary);
+}
+
+function setField(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+// ── Render all sections ───────────────────────────────────────────────────────
+function renderAllSections(secMap) {
+  lineCounters = {};
+  let globalLine = 1;
+
+  const allSections = [...SECTION_ORDER_LEFT, ...SECTION_ORDER_RIGHT];
+  allSections.forEach(secName => {
+    const items = secMap[secName] || [];
+    const container = document.getElementById(`rows-${secName}`);
+    if (!container) return;
+    container.innerHTML = '';
+
+    items.forEach((item, idx) => {
+      globalLine = addRowToSection(container, secName, item, globalLine);
+    });
+
+    // Always add at least 3 empty rows for writing space
+    const emptyCount = Math.max(0, 3 - items.length);
+    for (let i = 0; i < emptyCount; i++) {
+      globalLine = addRowToSection(container, secName, null, globalLine);
+    }
+
+    // Add row button
+    const btn = document.createElement('button');
+    btn.className = 'add-row-btn';
+    btn.textContent = '+ add row';
+    btn.onclick = () => {
+      globalLine = addRowToSection(container, secName, null, globalLine);
+    };
+    container.appendChild(btn);
+  });
+}
+
+function addRowToSection(container, secName, item, lineNum) {
+  const row = document.createElement('div');
+  row.className = 'cl-row';
+  row.dataset.section = secName;
+
+  const l = item ? item.dimension_l : '';
+  const w = item ? item.dimension_w : '';
+  const q = item ? item.quantity : '';
+  const name = item ? (item.name || '') : '';
+
+  row.innerHTML = `
+    <div class="row-num">${lineNum}</div>
+    <div class="row-dim">
+      <span class="panel-name" contenteditable="true" title="Panel name">${name}</span>
+      <span class="dim-cell">
+        <input type="number" class="dim-l" value="${l}" placeholder="L" title="Length mm">
+        <span class="dim-sep">×</span>
+        <input type="number" class="dim-w" value="${w}" placeholder="W" title="Width mm">
+        <span class="dim-sep">=</span>
+        <input type="number" class="dim-q qty-cell" value="${q}" placeholder="qty" title="Qty">
+      </span>
+      <button class="del-row-btn" onclick="this.closest('.cl-row').remove()" title="Remove row">✕</button>
+    </div>
+  `;
+
+  // Insert before the add button if it exists
+  const btn = container.querySelector('.add-row-btn');
+  if (btn) container.insertBefore(row, btn);
+  else container.appendChild(row);
+
+  return lineNum + 1;
+}
+
+// ── Sheet count summary ───────────────────────────────────────────────────────
+function updateSummary(mat) {
+  const el = document.getElementById('sheet-summary');
+  if (!mat) { el.textContent = ''; return; }
+  const t18 = mat.estimated_sheets_18mm || 0;
+  const t6  = mat.estimated_sheets_6mm  || 0;
+  const t8  = mat.estimated_sheets_8mm  || 0;
+  const total = t18 + t6 + t8;
+  let parts = [];
+  if (t18) parts.push(`${t18} × 18mm`);
+  if (t8)  parts.push(`${t8} × 8mm`);
+  if (t6)  parts.push(`${t6} × 6mm`);
+  el.textContent = `${total} Sheets total  (${parts.join('   ')})`;
+}
+
+// ── Add row via prompt ────────────────────────────────────────────────────────
+function addRowPrompt() {
+  const sections = [...SECTION_ORDER_LEFT, ...SECTION_ORDER_RIGHT];
+  const secChoice = prompt(
+    'Which section?\n' + sections.map((s,i) => `${i+1}. ${s}`).join('\n')
+  );
+  if (!secChoice) return;
+  const idx = parseInt(secChoice) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= sections.length) return;
+  const secName = sections[idx];
+  const container = document.getElementById(`rows-${secName}`);
+  if (!container) return;
+  const currentLines = container.querySelectorAll('.cl-row').length;
+  addRowToSection(container, secName, null, currentLines + 1);
+}
+
+// ── Reset ─────────────────────────────────────────────────────────────────────
+function resetData() {
+  if (!confirm('Reset all data?')) return;
+  if (cuttingData) loadData(cuttingData);
+  else renderAllSections({});
+}
+</script>
+</body>
+</html>

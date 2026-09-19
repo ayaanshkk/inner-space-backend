@@ -7,15 +7,12 @@ from sqlalchemy.exc import SQLAlchemyError
 
 load_dotenv()
 
-# Load DATABASE_URL from environment variable
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Fallback to local SQLite database if DATABASE_URL not set
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./local.db"
     print("⚠️ Using local SQLite database (DATABASE_URL not found in environment).")
-    
-    # Create SQLAlchemy engine for SQLite
+
     engine = create_engine(
         DATABASE_URL,
         pool_pre_ping=True,
@@ -23,79 +20,78 @@ if not DATABASE_URL:
     )
 else:
     print("✅ Using hosted PostgreSQL database.")
-    
-    # ✅ CRITICAL FIX: SQLAlchemy 2.x requires 'postgresql://' instead of 'postgres://'
+
+    # Fix dialect prefix for SQLAlchemy 2.x
     if DATABASE_URL.startswith('postgres://'):
         DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-        print("✅ Fixed database URL dialect for SQLAlchemy 2.x (postgres -> postgresql)")
-    
-    # ✅ CRITICAL FIX: Remove the ?pgbouncer=true parameter
-    # It's just a reminder for us - PostgreSQL doesn't understand it!
-    if '?pgbouncer=true' in DATABASE_URL:
-        DATABASE_URL = DATABASE_URL.replace('?pgbouncer=true', '')
-        print("✅ Cleaned pgbouncer parameter from connection string")
-    elif '&pgbouncer=true' in DATABASE_URL:
-        DATABASE_URL = DATABASE_URL.replace('&pgbouncer=true', '')
-        print("✅ Cleaned pgbouncer parameter from connection string")
-    
-    # Check which port is being used
+        print("✅ Fixed database URL dialect (postgres -> postgresql)")
+
+    # Strip pgbouncer hint — not a valid Postgres param
+    for param in ('?pgbouncer=true', '&pgbouncer=true'):
+        if param in DATABASE_URL:
+            DATABASE_URL = DATABASE_URL.replace(param, '')
+            print("✅ Cleaned pgbouncer parameter from connection string")
+
+    # ── Port correction ───────────────────────────────────────────────────────
+    # Session mode (5432): holds one connection per client for the full session.
+    # Transaction mode (6543): returns the connection to the pool after each
+    # transaction, so far fewer physical connections are needed.
+    # Supabase free tier caps session mode at 15 simultaneous clients, which a
+    # Flask dev server with a few concurrent requests exhausts immediately.
+    # Transaction mode has no such per-client cap — switch unconditionally.
     if ':5432' in DATABASE_URL:
-        print("⚠️  WARNING: Using port 5432 (Session Mode)")
-        print("   For better performance, consider switching to port 6543 (Transaction Mode)")
+        DATABASE_URL = DATABASE_URL.replace(':5432', ':6543', 1)
+        print("✅ Switched from port 5432 (session mode) → 6543 (transaction mode)")
     elif ':6543' in DATABASE_URL:
-        print("✅ Using port 6543 (Transaction Mode with pgBouncer)")
-    
-    # ✅ CRITICAL FIX: Optimized connection pool settings for Supabase
+        print("✅ Using port 6543 (transaction mode / pgBouncer)")
+
+    # ── Pool settings for transaction mode ───────────────────────────────────
+    # In transaction mode each connection is shared, so a pool of 5+10 can
+    # serve many more concurrent requests than session mode ever could.
+    # pool_recycle keeps connections from going stale (Supabase closes idle
+    # ones after ~5 min); pool_pre_ping verifies them before use.
     engine = create_engine(
         DATABASE_URL,
-        # Connection pool settings optimized for Supabase
-        pool_size=2,              # ✅ Max 2 permanent connections (reduced from default 5)
-        max_overflow=3,           # ✅ Allow 3 additional temporary connections (reduced from default 10)
-        pool_timeout=30,          # ✅ Wait up to 30 seconds for a connection
-        pool_recycle=300,         # ✅ Recycle connections after 5 minutes (Supabase closes idle connections)
-        pool_pre_ping=True,       # ✅ Verify connection health before using
-        
-        # Connection parameters
+        pool_size=5,          # permanent connections kept open
+        max_overflow=10,      # burst connections (total cap = 15)
+        pool_timeout=30,      # wait up to 30 s before raising an error
+        pool_recycle=300,     # recycle after 5 min (matches Supabase idle timeout)
+        pool_pre_ping=True,   # health-check before handing out a connection
         connect_args={
-            "connect_timeout": 10,  # 10 second connection timeout
+            "connect_timeout": 10,
         },
-        
-        # Other settings
         future=True,
-        echo=False  # Set to True for SQL debugging
+        echo=False,
     )
-    
-    print(f"✅ Connection pool configured: pool_size=2, max_overflow=3 (max total: 5 connections)")
 
-# Create a configured "Session" class
+    print("✅ Connection pool configured: pool_size=5, max_overflow=10 (max total: 15)")
+
+# ── Session factory ───────────────────────────────────────────────────────────
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
     bind=engine,
     future=True,
-    expire_on_commit=False  # ✅ Prevents attributes from expiring after commit
+    expire_on_commit=False,
 )
 
-# Base class for declarative models
 Base = declarative_base()
 
 
-# ✅ Add event listeners for connection monitoring (optional but helpful)
+# ── Connection lifecycle hooks ────────────────────────────────────────────────
 @event.listens_for(engine, "connect")
 def receive_connect(dbapi_conn, connection_record):
-    """Called when a new database connection is created"""
-    # You can add connection setup here if needed
     pass
 
 @event.listens_for(engine, "close")
 def receive_close(dbapi_conn, connection_record):
-    """Called when a database connection is closed"""
-    # You can add connection cleanup here if needed
     pass
 
 
+# ── Public helpers ────────────────────────────────────────────────────────────
+
 def get_db():
-    """Dependency-style session generator"""
+    """Dependency-style session generator."""
     db = SessionLocal()
     try:
         yield db
@@ -104,56 +100,43 @@ def get_db():
 
 
 def test_connection():
-    """Optional: Check DB connection for diagnostics"""
+    """Quick liveness check — returns True on success."""
     try:
+        from sqlalchemy import text
         with engine.connect() as conn:
-            # Test with a simple query
-            from sqlalchemy import text
-            result = conn.execute(text("SELECT 1"))
-            result.fetchone()
-            print("✅ Database connection successful.")
-            return True
+            conn.execute(text("SELECT 1"))
+        print("✅ Database connection successful.")
+        return True
     except SQLAlchemyError as e:
         print(f"❌ Database connection failed: {e}")
         return False
 
 
-# 👇 Legacy compatibility function for routes still using get_db_connection()
 def get_db_connection():
-    """
-    Legacy wrapper for backward compatibility with old code expecting
-    a raw connection (like SQLite). Now returns an SQLAlchemy connection.
-    """
+    """Legacy wrapper for routes that expect a raw SQLAlchemy connection."""
     try:
-        conn = engine.connect()
-        return conn
+        return engine.connect()
     except SQLAlchemyError as e:
         print(f"❌ Error creating database connection: {e}")
         raise
 
 
 def init_db():
-    """Initialize database tables - only creates if they don't exist"""
+    """Create any missing tables without touching existing data."""
     from backend.models import (
-        User, Customer, Project, Job, Assignment, 
+        User, Customer, Project, Job, Assignment,
         CustomerFormData, DrawingDocument, FormDocument,
         MaterialOrder, ProductionNotification, Quotation, QuotationItem, Fitter
     )
-    
-    # ✅ CRITICAL: checkfirst=True ensures existing data is NOT dropped
     Base.metadata.create_all(bind=engine, checkfirst=True)
-    print("✅ Database tables initialized")
+    print("✅ Database tables initialised")
 
 
 def dispose_connections():
-    """
-    Dispose of all connections in the pool.
-    Call this when shutting down the application.
-    """
+    """Release all pooled connections — called on shutdown."""
     engine.dispose()
     print("🧹 All database connections disposed")
 
 
-# ✅ Add this for graceful shutdown
 import atexit
 atexit.register(dispose_connections)
