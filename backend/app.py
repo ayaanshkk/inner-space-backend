@@ -46,36 +46,35 @@ def create_app():
         traceback.print_exc()
 
     # ============================================
-    # CORS - Production Ready
+    # CORS
     # ============================================
-    CORS(
-        app,
-        resources={r"/*": {"origins": "*"}},
-        supports_credentials=False,
-    )
+    ALLOWED_ORIGINS = [
+        "https://inner-space-frontend.vercel.app",
+        "https://api-inner-space.techmynt.ai",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
 
-    # ============================================
-    # PREFLIGHT HANDLER
-    # ============================================
     @app.before_request
     def handle_preflight():
         if request.method == "OPTIONS":
+            origin = request.headers.get("Origin", "")
             resp = jsonify({"status": "ok"})
-            resp.headers["Access-Control-Allow-Origin"] = "*"
+            resp.headers["Access-Control-Allow-Origin"] = origin if origin in ALLOWED_ORIGINS else ""
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "*"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Tenant-ID"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
             return resp, 200
 
-    # ============================================
-    # AFTER-REQUEST HEADERS
-    # ============================================
     @app.after_request
     def add_cors_headers(resp):
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "*"
+        origin = request.headers.get("Origin", "")
+        if origin in ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Tenant-ID"
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp
-
 
     # ============================================
     # BLUEPRINTS
@@ -84,28 +83,26 @@ def create_app():
         auth_routes, db_routes,
         notification_routes, assignment_routes,
         customer_routes, file_routes,
-        job_routes, action_items_routes, manual_cabinet, # materials_routes, analysis_routes
+        job_routes, action_items_routes, manual_cabinet,
     )
-    
+
     app.register_blueprint(auth_routes.auth_bp)
     app.register_blueprint(customer_routes.customer_bp)
     app.register_blueprint(db_routes.db_bp)
     app.register_blueprint(notification_routes.notification_bp)
     app.register_blueprint(assignment_routes.assignment_bp)
     app.register_blueprint(file_routes.file_bp)
-    # app.register_blueprint(materials_routes.materials_bp)
     app.register_blueprint(job_routes.job_bp)
     app.register_blueprint(action_items_routes.action_items_bp)
     app.register_blueprint(manual_cabinet.manual_cabinet_bp)
-    # app.register_blueprint(analysis_routes.analysis_bp)
-        
+
     # ============================================
     # HEALTH CHECK
     # ============================================
     @app.route("/health", methods=["GET"])
     def health_check():
         return jsonify({"status": "ok", "message": "Server is running"}), 200
-    
+
     # ============================================
     # PUBLIC TEST ENDPOINT
     # ============================================
