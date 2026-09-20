@@ -49,10 +49,10 @@ def create_app():
     # CORS
     # ============================================
     ALLOWED_ORIGINS = [
-        "https://inner-space-frontend.vercel.app",
-        "https://api-inner-space.techmynt.ai",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
+        'https://inner-space-frontend.vercel.app',
+        'https://api.innerspace.techmynt.com',
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
     ]
 
     @app.before_request
