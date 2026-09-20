@@ -53,18 +53,22 @@ def get_most_advanced_stage(stages):
 @customer_bp.route('/customers', methods=['GET', 'OPTIONS'])
 @token_required
 def get_customers():
-    """Get all clients/customers with their opportunity counts and document counts"""
-    
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-    
+
     session = SessionLocal()
     try:
-        tenant_id = get_current_tenant_id()
-        
-        # Get all clients for tenant
+        tenant_id   = get_current_tenant_id()
+        employee_id = get_current_employee_id()
+
+        # ── Role check via request.current_user (auth_helpers pattern) ──
+        current_user = request.current_user if hasattr(request, 'current_user') else {}
+        role_ids_str = current_user.get('role_ids', '')
+        user_roles   = [int(r.strip()) for r in role_ids_str.split(',') if r.strip().isdigit()]
+        is_sales_only = (3 in user_roles) and not any(r in user_roles for r in [1, 2])
+
         query = text("""
-            SELECT 
+            SELECT
                 c.client_id,
                 c.client_company_name,
                 c.client_contact_name,
@@ -80,56 +84,69 @@ def get_customers():
                 c.is_archived,
                 e.employee_name as salesperson_name,
                 COUNT(DISTINCT o.opportunity_id) as opportunity_count,
-                COUNT(DISTINCT cd.id) as document_count
+                COUNT(DISTINCT cd.id)            as document_count
             FROM "StreemLyne_MT"."Client_Master" c
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" e ON c.assigned_employee_id = e.employee_id
-            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" o ON c.client_id = o.client_id AND o.deleted_at IS NULL
-            LEFT JOIN "StreemLyne_MT"."Customer_Documents" cd ON c.client_id = cd.client_id
-            WHERE c.tenant_id = :tenant_id
-            AND c.is_deleted = false
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" e
+                ON c.assigned_employee_id = e.employee_id
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" o
+                ON c.client_id = o.client_id AND o.deleted_at IS NULL
+            LEFT JOIN "StreemLyne_MT"."Customer_Documents" cd
+                ON c.client_id = cd.client_id
+            WHERE c.tenant_id  = :tenant_id
+            AND c.is_deleted  = false
+            AND (
+                :is_sales_only = false
+                OR c.assigned_employee_id = :employee_id
+            )
             GROUP BY c.client_id, e.employee_name
-            ORDER BY c.created_at DESC
+            ORDER BY
+                CASE WHEN LOWER(c.stage) = 'accepted' THEN 0 ELSE 1 END,
+                c.created_at DESC
         """)
-        
-        result = session.execute(query, {'tenant_id': tenant_id})
+
+        result  = session.execute(query, {
+            'tenant_id':    tenant_id,
+            'employee_id':  employee_id,
+            'is_sales_only': is_sales_only,
+        })
         clients = result.fetchall()
-        
-        current_app.logger.info(f"📊 Fetching data for {len(clients)} clients")
-        
+
+        current_app.logger.info(f"📊 Fetching data for {len(clients)} clients (sales_only={is_sales_only})")
+
         customers = []
         for client in clients:
             customer_data = {
-                'id': client.client_id,
-                'name': client.client_company_name or client.client_contact_name or 'Unknown',
-                'phone': client.client_phone or client.client_mobile or '',
-                'email': client.client_email or '',
-                'address': client.address or '',
-                'postcode': client.post_code or '',
-                'salesperson': client.salesperson_name or '',
-                'stage': client.stage or 'Lead',
-                'status': 'Archived' if client.is_archived else 'Active',
-                'created_at': client.created_at.isoformat() if client.created_at else None,
-                'project_count': client.opportunity_count or 0,
+                'id':           client.client_id,
+                'name':         client.client_company_name or client.client_contact_name or 'Unknown',
+                'phone':        client.client_phone or client.client_mobile or '',
+                'email':        client.client_email or '',
+                'address':      client.address or '',
+                'postcode':     client.post_code or '',
+                'salesperson':  client.salesperson_name or '',
+                'stage':        client.stage or 'Lead',
+                'status':       'Archived' if client.is_archived else 'Active',
+                'created_at':   client.created_at.isoformat() if client.created_at else None,
+                'updated_at':   client.created_at.isoformat() if client.created_at else None,  # fallback
+                'created_by':   client.assigned_employee_id,
+                'project_count':   client.opportunity_count or 0,
                 'total_documents': client.document_count or 0,
-                'has_documents': (client.document_count or 0) > 0,
-                # Legacy fields for compatibility
-                'contact_made': 'Unknown',
+                'has_documents':   (client.document_count or 0) > 0,
+                'contact_made':             'Unknown',
                 'preferred_contact_method': 'Phone',
-                'marketing_opt_in': False,
-                'notes': '',
-                'form_count': 0,
-                'drawing_count': 0,
-                'form_document_count': 0,
-                'has_drawings': False,
-                'has_forms': False,
-                'project_types': []
+                'marketing_opt_in':         False,
+                'notes':                    '',
+                'form_count':               0,
+                'drawing_count':            0,
+                'form_document_count':      0,
+                'has_drawings':             False,
+                'has_forms':                False,
+                'project_types':            [],
             }
             customers.append(customer_data)
-        
+
         current_app.logger.info(f"✅ Returning {len(customers)} customers")
-        
         return jsonify(customers), 200
-        
+
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching customers: {e}")
         return jsonify({'error': 'Failed to fetch customers'}), 500

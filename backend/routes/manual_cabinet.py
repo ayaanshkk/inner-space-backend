@@ -2234,6 +2234,38 @@ def calculate_kitchen():
         logger.error(f"Kitchen calculation failed: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
+
+
+@manual_cabinet_bp.route('/api/manual-cabinet/export-cutting-list-pdf', methods=['POST', 'OPTIONS'])
+@token_required
+def export_cutting_list_pdf():
+    """
+    Accepts the same payload as sessionStorage cutting_list_preview_data.
+    Returns a PDF binary as application/pdf.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    try:
+        from .generate_cutting_list_pdf import generate_cutting_list_pdf
+        data = request.get_json() or {}
+        if not data:
+            return jsonify({"success": False, "error": "No data"}), 400
+
+        pdf_bytes = generate_cutting_list_pdf(data)
+        project = data.get('project_name', 'cutting_list').replace(' ', '_')
+
+        buf = io.BytesIO(pdf_bytes)
+        buf.seek(0)
+        return send_file(
+            buf,
+            mimetype='application/pdf',
+            as_attachment=False,
+            download_name=f'{project}_cutting_list.pdf'
+        )
+    except Exception as e:
+        logger.error(f"PDF export failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @manual_cabinet_bp.route('/api/manual-cabinet/reference', methods=['GET', 'OPTIONS'])
 @token_required
 def get_reference_data():
